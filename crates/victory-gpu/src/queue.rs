@@ -232,138 +232,6 @@ fn system_timestamp() -> u64 {
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(windows)]
-static WORLD_TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// Selected target index for `VICTORY_PRESENT_WORLD`: `None` = normal swapchain
-/// output, `Some(i)` = lock onto target `i` from the frame's `>= 1280x720`
-/// color targets. Cycle live with F8 (prev), F9 (next), F10 (normal).
-#[cfg(windows)]
-static WORLD_TARGET_IDX: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
-
-#[cfg(windows)]
-fn present_world_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_PRESENT_WORLD").is_some()
-            || std::env::var_os("VICTORY_PRESENT_1440P").is_some()
-    })
-}
-
-/// Notes a `>= 1280x720` color or HDR (`f10`/`f24`/`f26`) texture written via
-/// RTV or UAV when `VICTORY_PRESENT_WORLD` (or `VICTORY_PRESENT_1440P`) is set,
-/// preserving first-use order so F7/F8 can lock onto a specific 3D or cutscene
-/// target without flicker.
-#[cfg(windows)]
-pub(crate) fn note_world_target(resource: This) {
-    use windows::Win32::Graphics::Direct3D12::{
-        D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
-    };
-    if resource.is_null() || !present_world_on() {
-        return;
-    }
-    let key = resource as usize;
-    let mut list = WORLD_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if list.len() >= 32 || list.iter().any(|&(k, _)| k == key) {
-        return;
-    }
-    let Some(copy) = crate::resource::host_copy(resource) else {
-        return;
-    };
-    // SAFETY: a live host texture.
-    let d = unsafe { copy.texture.GetDesc() };
-    if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        && d.SampleDesc.Count == 1
-        && d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
-        && d.Width >= 1280
-        && d.Height >= 720
-        && matches!(d.Format.0, 10 | 24 | 26 | 28 | 29 | 87 | 91)
-    {
-        list.push((key, copy));
-    }
-}
-
-#[cfg(windows)]
-fn pick_world_target(
-    primary_w: u64,
-    primary_h: u32,
-) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn GetAsyncKeyState(vkey: i32) -> i16;
-    }
-    if !present_world_on() {
-        return None;
-    }
-    let all = std::mem::take(&mut *WORLD_TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
-    let cands: Vec<std::sync::Arc<crate::resource::HostTexture>> = all
-        .into_iter()
-        .map(|(_, c)| c)
-        .filter(|c| {
-            // SAFETY: a live host texture.
-            let d = unsafe { c.texture.GetDesc() };
-            (d.Width, d.Height) != (primary_w, primary_h)
-        })
-        .collect();
-    // Poll F6 (0x75 auto/normal), F7 (0x76 prev), F8 (0x77 next) with edge trigger.
-    // Avoids F9 (Discord mute).
-    static LAST_KEYS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-    // SAFETY: Win32 key-state query.
-    let (f6, f7, f8) = unsafe {
-        (
-            (GetAsyncKeyState(0x75) as u16 & 0x8000) != 0,
-            (GetAsyncKeyState(0x76) as u16 & 0x8000) != 0,
-            (GetAsyncKeyState(0x77) as u16 & 0x8000) != 0,
-        )
-    };
-    let bits = u8::from(f6) | (u8::from(f7) << 1) | (u8::from(f8) << 2);
-    let prev = LAST_KEYS.swap(bits, Ordering::Relaxed);
-    let pressed = bits & !prev;
-    let mut idx = WORLD_TARGET_IDX.lock().unwrap_or_else(|e| e.into_inner());
-    if pressed & 1 != 0 {
-        *idx = None;
-        tracing::info!("VICTORY_PRESENT_WORLD: auto/normal mode (F6)");
-    } else if !cands.is_empty() {
-        if pressed & 4 != 0 {
-            let next = idx.map_or(0, |i| (i + 1) % cands.len());
-            *idx = Some(next);
-            // SAFETY: live host texture.
-            let d = unsafe { cands[next].texture.GetDesc() };
-            tracing::info!(
-                target = next,
-                total = cands.len(),
-                width = d.Width,
-                height = d.Height,
-                format = d.Format.0,
-                "VICTORY_PRESENT_WORLD: locked target (F8 next / F7 prev / F6 auto)"
-            );
-        } else if pressed & 2 != 0 {
-            let next = idx.map_or(cands.len() - 1, |i| (i + cands.len() - 1) % cands.len());
-            *idx = Some(next);
-            // SAFETY: live host texture.
-            let d = unsafe { cands[next].texture.GetDesc() };
-            tracing::info!(
-                target = next,
-                total = cands.len(),
-                width = d.Width,
-                height = d.Height,
-                format = d.Format.0,
-                "VICTORY_PRESENT_WORLD: locked target (F8 next / F7 prev / F6 auto)"
-            );
-        }
-    }
-    if let Some(chosen) = *idx {
-        return cands.get(chosen).or_else(|| cands.last()).cloned();
-    }
-    // Auto mode: prefer a decoded cutscene video target (height 736/1088) when
-    // present, otherwise leave normal swapchain output (menus/high-contrast).
-    cands.into_iter().find(|c| {
-        // SAFETY: live host texture.
-        let d = unsafe { c.texture.GetDesc() };
-        matches!(d.Height, 736 | 1088) && matches!(d.Format.0, 28 | 29 | 87 | 91)
-    })
-}
-
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -439,20 +307,10 @@ extern "system" fn present(
             }
         }
         if !resources.is_empty() {
-            let mut sources: Vec<(&_, u32)> = resources
+            let sources: Vec<(&_, u32)> = resources
                 .iter()
                 .map(|(_, tex, state)| (*tex, *state))
                 .collect();
-            // SAFETY: live host texture.
-            let prim_d = unsafe { sources[0].0.GetDesc() };
-            let fallback_world = pick_world_target(prim_d.Width, prim_d.Height);
-            if let Some(ref copy) = fallback_world {
-                let state = crate::host::legal_state(
-                    &copy.texture,
-                    copy.state.load(Ordering::Relaxed),
-                );
-                sources[0] = (&copy.texture, state);
-            }
             let shown = host.present(&sources, frame);
             for &(resource, _, state) in &resources {
                 crate::resource::host_transition(resource, state);
