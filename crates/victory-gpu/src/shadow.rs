@@ -424,22 +424,6 @@ impl Shadow {
     }
 }
 
-/// The parts of `[from, to)` outside every range in `ranges`, in order.
-fn outside(from: usize, to: usize, mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    ranges.sort_unstable();
-    let (mut at, mut parts) = (from, Vec::new());
-    for (a, e) in ranges {
-        if at < to && a > at {
-            parts.push((at, a.min(to)));
-        }
-        at = at.max(e);
-    }
-    if at < to {
-        parts.push((at, to));
-    }
-    parts
-}
-
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -636,7 +620,7 @@ mod tests {
         assert_eq!(peek(b + 6), 3, "the title's byte from before");
         // What the shader wrote does go back, in either kind of range.
         assert_eq!((peek(a + 7), peek(b + 9)), (9, 7));
-        assert!(s.before.lock().unwrap().is_none(), "the snapshot is done");
+        assert!(s.before.lock().unwrap().pages.is_empty(), "the snapshot is done");
     }
 
     /// Two declared ranges that overlap: the first one's copy-back gives
