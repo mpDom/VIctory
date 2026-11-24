@@ -236,17 +236,22 @@ static LAST_1440P: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostT
     std::sync::Mutex::new(None);
 
 #[cfg(windows)]
-fn present_1440p_on() -> bool {
+fn present_world_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_1440P").is_some())
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_PRESENT_WORLD").is_some()
+            || std::env::var_os("VICTORY_PRESENT_1440P").is_some()
+    })
 }
 
-/// Notes a `2560x1440` color RTV bound via `OMSetRenderTargets` when
-/// `VICTORY_PRESENT_1440P` is set (only RTVs, skipping compute UAV clears).
+/// Notes a `>= 1280x720` color texture written via RTV or UAV when
+/// `VICTORY_PRESENT_WORLD` (or `VICTORY_PRESENT_1440P`) is set, so we can
+/// display the internal rendered 3D world target on both Series S and Series X
+/// while the final upscale pass outputs zero.
 #[cfg(windows)]
-pub(crate) fn note_rtv_1440p(resource: This) {
+pub(crate) fn note_world_target(resource: This) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    if resource.is_null() || !present_1440p_on() {
+    if resource.is_null() || !present_world_on() {
         return;
     }
     let Some(copy) = crate::resource::host_copy(resource) else {
@@ -256,8 +261,8 @@ pub(crate) fn note_rtv_1440p(resource: This) {
     let d = unsafe { copy.texture.GetDesc() };
     if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
         && d.SampleDesc.Count == 1
-        && d.Width == 2560
-        && d.Height == 1440
+        && d.Width >= 1280
+        && d.Height >= 720
         && matches!(d.Format.0, 28 | 29 | 87 | 91)
     {
         *LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
@@ -266,7 +271,7 @@ pub(crate) fn note_rtv_1440p(resource: This) {
 
 #[cfg(windows)]
 fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
-    if !present_1440p_on() {
+    if !present_world_on() {
         return None;
     }
     LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()).take()
@@ -348,22 +353,29 @@ extern "system" fn present(
                 .map(|(_, tex, state)| (*tex, *state))
                 .collect();
             if let Some(ref copy) = fallback_1440p {
-                let state = crate::host::legal_state(
-                    &copy.texture,
-                    copy.state.load(Ordering::Relaxed),
-                );
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    // SAFETY: a live host texture.
-                    let d = unsafe { copy.texture.GetDesc() };
-                    tracing::info!(
-                        width = d.Width,
-                        height = d.Height,
-                        format = d.Format.0,
-                        "VICTORY_PRESENT_1440P: presenting 2560x1440 RTV world target as plane 0"
+                // SAFETY: live host textures.
+                let (prim_d, cand_d) = unsafe { (sources[0].0.GetDesc(), copy.texture.GetDesc()) };
+                // Only substitute when the internal world target is smaller than
+                // the presented plane 0 (so native-res menus & title cards stay
+                // untouched).
+                if (cand_d.Width, cand_d.Height) != (prim_d.Width, prim_d.Height) {
+                    let state = crate::host::legal_state(
+                        &copy.texture,
+                        copy.state.load(Ordering::Relaxed),
                     );
-                });
-                sources[0] = (&copy.texture, state);
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::info!(
+                            width = cand_d.Width,
+                            height = cand_d.Height,
+                            format = cand_d.Format.0,
+                            primary_w = prim_d.Width,
+                            primary_h = prim_d.Height,
+                            "VICTORY_PRESENT_WORLD: presenting internal world target as plane 0"
+                        );
+                    });
+                    sources[0] = (&copy.texture, state);
+                }
             }
             let shown = host.present(&sources, frame);
             for &(resource, _, state) in &resources {

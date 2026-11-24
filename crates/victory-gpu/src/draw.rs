@@ -273,7 +273,7 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
-            crate::queue::note_rtv_1440p(record.resource);
+            crate::queue::note_world_target(record.resource);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
@@ -1259,6 +1259,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            crate::queue::note_world_target(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
