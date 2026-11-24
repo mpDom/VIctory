@@ -3829,26 +3829,74 @@ impl<'a> Lower<'a> {
                     }
                     (props, None)
                 }
-                _ => return Err("a scalar memory read as data"),
+                _ => {
+                    // The use point is a scalar operation, not an image or buffer
+                    // access: the program reads the descriptor's words as data
+                    // (dimension or address arithmetic). Infer the view from the
+                    // used-resource entry instead of refusing the program.
+                    if used.is_some_and(|x| x.kind == ResourceType::Cbv) {
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    match used.map(|x| x.dwords) {
+                        Some(8) => ((2 | u, 0x409), Some(2)),
+                        _ => {
+                            let stride = used.map_or(0, |x| x.stride);
+                            let props = if stride >= 4 && stride.is_multiple_of(4) {
+                                (12 | u, stride)
+                            } else {
+                                (11 | u, 0)
+                            };
+                            (props, None)
+                        }
+                    }
+                }
             };
             (first, src, props, image, uav)
         } else {
-            // An image the program only measures (it reads the size bits and
-            // samples the image in other programs): eight dwords are an image
-            // descriptor, taken here as a 2D texture.
-            // shortcut: a 3D or array image would report depth or layers 1.
-            let src = Source::Loaded {
-                load: site,
-                first: 0,
-            };
-            if count != 8
-                || self
-                    .used_kind(&src)
-                    .is_some_and(|u| u.kind != ResourceType::Srv)
-            {
+            // The program never samples or stores through this descriptor: it
+            // only reads words as data (dimension math). Infer the view kind
+            // from the used-resource entry the load falls in (8 dwords as a 2D
+            // texture, 4 dwords as structured/raw buffer; CBVs still refused).
+            let mut guess = None;
+            for k in 0..count {
+                let src = Source::Loaded {
+                    load: site,
+                    first: k as u8,
+                };
+                if let Some(u) = self.used_kind(&src) {
+                    guess = Some((u, src, k as u8));
+                    break;
+                }
+            }
+            if let Some((used, src, first)) = guess {
+                if used.kind == ResourceType::Cbv {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                let uav = used.kind == ResourceType::Uav;
+                let u = if uav { 0x1000 } else { 0 };
+                let (props, image) = match used.dwords {
+                    8 => ((2 | u, 0x409), Some(2)),
+                    4 => {
+                        let stride = used.stride;
+                        let props = if stride >= 4 && stride.is_multiple_of(4) {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        (props, None)
+                    }
+                    _ => return Err("a descriptor read only as data"),
+                };
+                (first, src, props, image, uav)
+            } else if count == 8 {
+                let src = Source::Loaded {
+                    load: site,
+                    first: 0,
+                };
+                (0, src, (2, 0x409), Some(2), false)
+            } else {
                 return Err("a descriptor read only as data");
             }
-            (0, src, (2, 0x409), Some(2), false)
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -5132,13 +5180,23 @@ impl<'a> Lower<'a> {
                     Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                     _ => None,
                 };
-                // A selector that derives from neither EXEC nor a compare
-                // (a constant, a number built from scalars) is a mask held as
-                // a number: with console lanes the lane tests its own bit.
+                // A lane mask, else a mask the same in every lane (SCC as
+                // all lanes or none, a constant), else a mask held as a number
+                // when console lanes are active.
+                let uniform = inst
+                    .writes
+                    .first()
+                    .and_then(|w| self.x.st.uniform_selects.get(&w.1));
                 let m = mask
                     .and_then(|m| {
                         let others = self.console_lanes.then(|| self.x.st.others.get(&m));
-                        self.x.st.masks.get(&m).or(others.flatten()).copied()
+                        self.x
+                            .st
+                            .masks
+                            .get(&m)
+                            .or(uniform)
+                            .or(others.flatten())
+                            .copied()
                     })
                     .ok_or(UNTRACKED_SELECT)?;
                 let cond = self.boolean(m, c)?;
@@ -9338,90 +9396,12 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let lowered = lower(&Parts {
-=======
-    #[cfg(windows)]
-    fn validate(dxil: &[u8]) {
-        use super::super::validator::Validator;
-        let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
-            return;
-        };
-        let mut copy = dxil.to_vec();
-        v.validate(&mut copy).unwrap();
-        assert_eq!(copy[4..20], dxil[4..20], "container hash");
-    }
-
-    #[cfg(not(windows))]
-    fn validate(_: &[u8]) {}
-
-    #[test]
-    fn mad_32_16_and_lerp_u8_lower_and_validate() {
-        let vop3 = |op: u32, opsel: u32, vdst: u32, s0: u32, s1: u32, s2: u32| -> [u32; 2] {
-            [
-                (0x35 << 26) | ((op & 0x3FF) << 16) | ((opsel & 0xF) << 11) | (vdst & 0xFF),
-                (s0 & 0x1FF) | ((s1 & 0x1FF) << 9) | ((s2 & 0x1FF) << 18),
-            ]
-        };
-        // v0, v1, v2 are VGPRs 256..=258; result used in a pixel export so none are DCE'd.
-        let m0 = vop3(0x373, 0, 0, 256, 257, 258); // v_mad_u32_u16 v0, v0, v1, v2
-        let m1 = vop3(0x373, 3, 0, 256, 257, 256); // v_mad_u32_u16 v0, v0, v1, v0 (opsel hi)
-        let m2 = vop3(0x375, 0, 0, 256, 257, 258); // v_mad_i32_i16 v0, v0, v1, v2
-        let l0 = vop3(0x14D, 0, 0, 256, 257, 258); // v_lerp_u8 v0, v0, v1, v2
-        let words = [
-            0x7E00_0283, // v_mov_b32 v0, 3
-            0x7E02_0285, // v_mov_b32 v1, 5
-            0x7E04_0287, // v_mov_b32 v2, 7
-            m0[0],
-            m0[1],
-            m1[0],
-            m1[1],
-            m2[0],
-            m2[1],
-            l0[0],
-            l0[1],
-            0xF800_180F,
-            0x0000_0000, // exp mrt0 v0, v0, v0, v0 done vm
-            S_ENDPGM,
-        ];
-        let native = NativeProgram {
-            stage: HwStage::Ps,
-            wave64: false,
-            vgprs: 4,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Ps {
-                inputs: vec![],
-                input_addr: 0,
-                db_shader_control: 0,
-                patches: vec![],
-            },
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        let target = super::SigElement {
-            name: "SV_Target".into(),
-            index: 0,
-            kind: 16,
-            comp: 9,
-            interp: 0,
-            row: Some(0),
-            col: 0,
-            cols: 4,
-            usage: 0,
-            half: false,
-        };
-        let l = lower(&Parts {
->>>>>>> 5319a34 (Shaders: lower v_mad_u32_u16, v_mad_i32_i16, and v_lerp_u8)
             native: &native,
             p: &p,
             st: &st,
             io: &io,
             res: &res,
             inputs: vec![],
-<<<<<<< HEAD
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
@@ -9534,9 +9514,43 @@ mod tests {
             outputs: vec![target],
             prims: vec![],
             mesh_stride: 0,
+            target: super::super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
         .unwrap();
         validate(&l.dxil);
+    }
+
+    #[test]
+    fn selects_on_masks_the_same_in_every_lane_need_no_lane_index() {
+        let select = |mask: &[u32], wave64: bool| {
+            let mut words = vec![0xBF06_0100]; // s_cmp_eq_u32 s0, s1
+            words.extend_from_slice(mask);
+            words.extend_from_slice(&[
+                0xD501_0001,
+                0x000A_0080, // v_cndmask_b32 v1, 0, v0, s2 (s[2:3])
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]);
+            let layout = vec![
+                root(RootType::Constants, 0, 0),
+                root(RootType::Constants, 1, 1),
+            ];
+            lower_wave(&words, layout, vec![], wave64)
+        };
+        for (mask, wave64) in [
+            (0x8502_80C1, false), // s_cselect_b32 s2, -1, 0
+            (0x8502_C180, false), // s_cselect_b32 s2, 0, -1
+            (0xBE82_03C1, false), // s_mov_b32 s2, -1
+            (0xBE82_0380, false), // s_mov_b32 s2, 0
+            (0x8582_80C1, true),  // s_cselect_b64 s[2:3], -1, 0
+            (0xBE82_04C1, true),  // s_mov_b64 s[2:3], -1
+        ] {
+            let l = select(&[mask], wave64).unwrap_or_else(|e| panic!("{mask:#x}: {e}"));
+            assert!(!l.wave_ops, "{mask:#x}");
+        }
     }
 }
 
