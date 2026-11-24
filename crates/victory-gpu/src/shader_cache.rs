@@ -26,6 +26,7 @@ use victory_shader::{HwStage, RootType};
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+static REFUSALS: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -37,9 +38,15 @@ pub fn use_shader_cache(dir: PathBuf) {
     }
 }
 
-/// Shaders found in the cache and translated since the start.
-pub(crate) fn counts() -> (u64, u64) {
-    (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
+/// Shaders found in the cache, translated, and refusals found in the
+/// cache (containers this build is known not to translate) since the
+/// start.
+pub(crate) fn counts() -> (u64, u64, u64) {
+    (
+        HITS.load(Ordering::Relaxed),
+        MISSES.load(Ordering::Relaxed),
+        REFUSALS.load(Ordering::Relaxed),
+    )
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
@@ -151,6 +158,8 @@ fn cached(
         if let Some(result) = entry {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
+            } else if result.is_err() {
+                (&REFUSALS, "refusal from the cache")
             } else {
                 (&HITS, "from the cache")
             };

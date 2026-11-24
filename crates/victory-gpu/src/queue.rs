@@ -404,8 +404,13 @@ extern "system" fn present(
         );
         #[cfg(windows)]
         if frame >= 256 {
-            let (hits, misses) = crate::shader_cache::counts();
-            tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            let (hits, misses, refusals) = crate::shader_cache::counts();
+            tracing::info!(
+                hits,
+                misses,
+                refusals,
+                "shaders from the cache, translated, and known refusals so far"
+            );
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
