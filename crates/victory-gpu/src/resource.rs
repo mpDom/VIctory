@@ -83,7 +83,7 @@ pub(crate) struct HeapDesc {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ResourceDesc {
     dimension: u32,
     alignment: u64,
@@ -873,6 +873,42 @@ pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
 }
 
+/// The physical memory behind a title address, if physical pages are
+/// mapped there: an opaque id of their allocation and the byte offset in
+/// it, the same at every address the pages are mapped at.
+pub type PhysicalResolver = fn(u64) -> Option<(u64, u64)>;
+static PHYSICAL_RESOLVER: std::sync::OnceLock<PhysicalResolver> = std::sync::OnceLock::new();
+
+/// The runtime's physical page lookup, which lets resources over the same
+/// physical pages share one host texture ([`Identity`]).
+pub fn use_physical_resolver(resolver: PhysicalResolver) {
+    let _ = PHYSICAL_RESOLVER.set(resolver);
+}
+
+/// Where a texture's memory is, as aliases see it. Titles alias render
+/// targets and other GPU-written textures by placing resources over the
+/// same memory: at one address (placed resources at one heap offset, or
+/// several resource objects at an address), or the same physical pages
+/// mapped at several addresses (`XMemMapPhysicalPages`, the GPU's page
+/// mapping copies). On the console they are one memory, so what one pass
+/// renders the next reads; here each resource has a host texture, and
+/// aliases must share it ([`shared_host`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Identity {
+    /// Physical pages: their allocation and the byte offset in it.
+    Physical(u64, u64),
+    /// Memory known only by its address: heaps, committed memory, and
+    /// reservations with no pages mapped when the resource was made.
+    Virtual(u64),
+}
+
+fn identity(at: u64) -> Identity {
+    match PHYSICAL_RESOLVER.get().and_then(|resolve| resolve(at)) {
+        Some((allocation, offset)) => Identity::Physical(allocation, offset),
+        None => Identity::Virtual(at),
+    }
+}
+
 /// Allocation attributes for resource memory: allocator id, page size
 /// (bits 14-15: 2 MiB pages from 2 MiB up, else 64 KiB), alignment as log2
 /// (bits 24-28) and memory type (bits 29-32: write-combined for GPU-only
@@ -1047,6 +1083,35 @@ pub(crate) struct HostTexture {
     /// its unordered access views name; lists keep the two coherent
     /// (`HostList::transition`).
     pub(crate) twin: Option<std::sync::Arc<HostTexture>>,
+    /// Bytes counted in the live host textures of title resources (0: not
+    /// counted).
+    counted: u64,
+}
+
+#[cfg(windows)]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        if self.counted != 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            LIVE[0].fetch_sub(1, Relaxed);
+            LIVE[1].fetch_sub(self.counted, Relaxed);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    pub(crate) fn new(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+    ) -> HostTexture {
+        HostTexture {
+            texture,
+            state: state.into(),
+            twin: None,
+            counted: 0,
+        }
+    }
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -1109,22 +1174,23 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
-#[cfg(windows)]
-fn host_texture(
-    desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    use windows::Win32::Graphics::Direct3D12::*;
-    const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
-    if desc.dimension == BUFFER {
-        return None;
-    }
-    let host = crate::host::host()?;
+/// Host resource flags: render target, depth, unordered access, no shader
+/// access.
+const RENDER_TARGET: u32 = 1;
+const DEPTH: u32 = 2;
+const UNORDERED: u32 = 4;
+const DENY_SHADER_RESOURCE: u32 = 8;
+/// The uses that make a host texture GPU-written (its contents are not
+/// taken from title memory, [`crate::texture::title_written`]).
+const GPU_WRITTEN: u32 = RENDER_TARGET | DEPTH | UNORDERED;
+
+/// The host description of a title texture: the console's layout and flags
+/// dropped, formats the host has.
+fn host_desc(desc: &ResourceDesc) -> ResourceDesc {
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
-    d.flags &= PC_FLAGS;
+    d.flags &= GPU_WRITTEN | DENY_SHADER_RESOURCE;
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; Grand Theft Auto VI's shadow maps ask for it): the host
     // copy loses UAV use, its unordered access views name a twin
@@ -1134,13 +1200,11 @@ fn host_texture(
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    const RENDER_TARGET: u32 = 1;
     d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
         target_format(d.format)
     } else {
         pc_format(d.format)
     };
-    const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
     {
@@ -1151,6 +1215,221 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    d
+}
+
+/// What must match for two aliases to share a host texture: its size,
+/// mips, samples and format family (views reinterpret within a family).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Shape {
+    dimension: u32,
+    width: u64,
+    height: u32,
+    depth_or_array_size: u16,
+    mips: u32,
+    samples: u32,
+    family: u32,
+}
+
+impl Shape {
+    fn of(host: &ResourceDesc) -> Shape {
+        Shape {
+            dimension: host.dimension,
+            width: host.width,
+            height: host.height,
+            depth_or_array_size: host.depth_or_array_size,
+            mips: mip_count(host),
+            samples: host.sample_count.max(1),
+            family: family(host.format),
+        }
+    }
+}
+
+/// The newest host texture at each memory identity and shape, with the
+/// title and host descriptions it was made for.
+#[cfg(windows)]
+struct Made {
+    console: ResourceDesc,
+    host: ResourceDesc,
+    texture: std::sync::Weak<HostTexture>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct Aliases {
+    made: std::collections::HashMap<(Identity, Shape), Made>,
+    /// The shape last made at each identity, to count aliases of another
+    /// shape (which cannot share a committed host texture).
+    shapes: std::collections::HashMap<Identity, (Shape, std::sync::Weak<HostTexture>)>,
+}
+
+#[cfg(windows)]
+static ALIASES: std::sync::Mutex<Option<Aliases>> = std::sync::Mutex::new(None);
+
+/// Alias counts since the start: resources that took another's host
+/// texture, those of them that took a GPU-written one, and resources over
+/// memory with a live host texture of another shape.
+#[cfg(windows)]
+static SHARED: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Host textures made for title resources and alive, and their bytes.
+#[cfg(windows)]
+static LIVE: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether aliases share host textures (`VICTORY_GPU_SHARE_ALIASES=0` turns
+/// it off, to compare).
+#[cfg(windows)]
+fn sharing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_GPU_SHARE_ALIASES").as_deref() != Ok("0"))
+}
+
+/// The host texture of a resource over memory at `at`: the one an alias
+/// over the same memory already has if it can serve, else a new one.
+///
+/// An alias shares a GPU-written host texture (render target, depth,
+/// unordered access) if it needs no use that texture lacks: what one pass
+/// writes through one resource the next reads through the other, as on the
+/// console. Title-written textures (contents uploaded from memory) are
+/// shared only by aliases with the same description, whose uploads agree.
+/// A new GPU-written texture becomes the one later aliases share.
+/// shortcut: aliases of another shape (a format of another family, another
+/// size) get their own host texture and so do not see each other's writes;
+/// they would need placed host resources in one host heap per physical
+/// range. Counted in the log line.
+#[cfg(windows)]
+fn shared_host(
+    at: u64,
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+) -> Option<std::sync::Arc<HostTexture>> {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
+    if desc.dimension == BUFFER {
+        return None;
+    }
+    let host = host_desc(desc);
+    let key = (identity(at), Shape::of(&host));
+    let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    let aliases = aliases.get_or_insert_with(Aliases::default);
+    let live = aliases
+        .made
+        .get(&key)
+        .and_then(|m| m.texture.upgrade().map(|t| (m, t)));
+    let gpu_written = host.flags & GPU_WRITTEN != 0;
+    if let Some((made, texture)) = &live {
+        let made_gpu = made.host.flags & GPU_WRITTEN;
+        let serves = if made_gpu != 0 {
+            host.flags & GPU_WRITTEN & !made_gpu == 0
+                && (made.host.flags & DENY_SHADER_RESOURCE == 0
+                    || host.flags & DENY_SHADER_RESOURCE != 0)
+        } else {
+            !gpu_written && made.console == *desc
+        };
+        if serves && sharing() {
+            SHARED[0].fetch_add(1, Relaxed);
+            if made_gpu != 0 {
+                SHARED[1].fetch_add(1, Relaxed);
+            }
+            tracing::debug!(
+                ?desc,
+                at = format_args!("{at:#x}"),
+                identity = ?key.0,
+                "an alias shares a host texture"
+            );
+            return Some(texture.clone());
+        }
+    }
+    if let Some((shape, other)) = aliases.shapes.get(&key.0)
+        && *shape != key.1
+        && other.strong_count() > 0
+    {
+        SHARED[2].fetch_add(1, Relaxed);
+        tracing::debug!(?desc, identity = ?key.0, "an alias of another shape gets its own host texture");
+    }
+    let texture = Arc::new(made_host(desc, state, clear)?);
+    // A GPU-written texture takes over: later aliases read what it renders.
+    if live.is_none() || gpu_written {
+        aliases.made.insert(
+            key,
+            Made {
+                console: *desc,
+                host,
+                texture: Arc::downgrade(&texture),
+            },
+        );
+        aliases
+            .shapes
+            .insert(key.0, (key.1, Arc::downgrade(&texture)));
+    }
+    // Forget released textures now and then.
+    if aliases.made.len().is_power_of_two() && aliases.made.len() >= 1024 {
+        aliases.made.retain(|_, m| m.texture.strong_count() > 0);
+        aliases.shapes.retain(|_, (_, t)| t.strong_count() > 0);
+    }
+    log_aliases();
+    Some(texture)
+}
+
+/// At most every 5 s, as host textures are made: how many title textures
+/// live on the host and their bytes, and the aliases found.
+#[cfg(windows)]
+fn log_aliases() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5)) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    let [shared, gpu, other] = [0, 1, 2].map(|i| SHARED[i].load(Relaxed));
+    let [count, bytes] = [0, 1].map(|i| LIVE[i].load(Relaxed));
+    tracing::info!(
+        "host textures: {count} live, {:.0} MB; {shared} aliases shared one ({gpu} GPU-written), \
+         {other} aliases of another shape{}",
+        bytes as f64 / f64::from(1 << 20),
+        if sharing() { "" } else { " (sharing off)" }
+    );
+}
+
+/// A new host texture for a title resource, counted while it lives.
+#[cfg(windows)]
+fn made_host(desc: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let texture = host_texture(desc, state, clear)?;
+    let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+    const BOTH: u32 = 2 | 4;
+    let twin = (desc.flags & BOTH == BOTH)
+        .then(|| host_twin(&texture))
+        .flatten()
+        .map(|t| std::sync::Arc::new(HostTexture::new(t, 0)));
+    let mut made = HostTexture::new(texture, state);
+    made.twin = twin;
+    // SAFETY: a live resource and its own description.
+    let bytes = crate::host::host().map_or(0, |h| unsafe {
+        let d = made.texture.GetDesc();
+        h.device.GetResourceAllocationInfo(0, &[d]).SizeInBytes
+    });
+    made.counted = bytes.max(1);
+    LIVE[0].fetch_add(1, Relaxed);
+    LIVE[1].fetch_add(bytes, Relaxed);
+    Some(made)
+}
+
+#[cfg(windows)]
+fn host_texture(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    if desc.dimension == BUFFER {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let mut d = host_desc(desc);
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -1275,7 +1554,13 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
 
 impl Resource {
     fn data(&self) -> *mut u8 {
-        match self.backing {
+        self.backing.data()
+    }
+}
+
+impl Backing {
+    fn data(&self) -> *mut u8 {
+        match *self {
             Backing::Committed(ref memory) => memory.ptr.as_ptr(),
             // SAFETY: placement checked the range lies inside the heap.
             Backing::Placed { heap, offset } => unsafe {
@@ -1310,7 +1595,7 @@ fn hand_out_resource(
     #[cfg(not(windows))]
     let _ = (state, clear);
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    let host = shared_host(backing.data() as u64, &desc, state, clear);
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1318,26 +1603,7 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            // Depth and unordered access (see `host_texture`).
-            const BOTH: u32 = 2 | 4;
-            let twin = (desc.flags & BOTH == BOTH)
-                .then(|| host_twin(&texture))
-                .flatten()
-                .map(|texture| {
-                    std::sync::Arc::new(HostTexture {
-                        texture,
-                        state: 0.into(),
-                        twin: None,
-                    })
-                });
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-                twin,
-            })
-        }),
+        host,
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -3029,5 +3295,167 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         assert!(!is_typeless(87));
         assert_eq!(first_concrete(87), 87);
+    }
+
+    #[cfg(windows)]
+    fn host_raw(r: This) -> Option<*mut c_void> {
+        use windows::core::Interface;
+        host_resource(r).map(Interface::as_raw)
+    }
+
+    /// Render targets placed over the same heap memory share one host
+    /// texture, and so does a sampled-only alias, which then reads what the
+    /// target renders instead of uploading the title's memory; other memory
+    /// or another shape gets its own.
+    #[cfg(windows)]
+    #[test]
+    fn aliased_render_targets_share_one_host_texture() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let heap = heap(64 * KIB_64);
+        let place = |offset, desc: &ResourceDesc| {
+            let mut out = null;
+            let hr = create_placed(
+                null,
+                heap,
+                offset,
+                desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            );
+            assert_eq!(hr, S_OK);
+            out
+        };
+        let target = ResourceDesc {
+            flags: RENDER_TARGET,
+            ..texture(256, 256, RGBA8_UNORM, 1)
+        };
+        let a = place(0, &target);
+        let b = place(0, &target);
+        assert!(host_raw(a).is_some());
+        assert_eq!(host_raw(a), host_raw(b), "two targets over one memory");
+
+        let sampled = place(0, &texture(256, 256, RGBA8_UNORM, 1));
+        assert_eq!(host_raw(sampled), host_raw(a));
+        assert!(!crate::texture::title_written(
+            host_resource(sampled).unwrap()
+        ));
+
+        let elsewhere = place(16 * KIB_64, &target);
+        assert_ne!(host_raw(elsewhere), host_raw(a), "other memory");
+        let before = SHARED[2].load(Relaxed);
+        let smaller = ResourceDesc {
+            flags: RENDER_TARGET,
+            ..texture(128, 128, RGBA8_UNORM, 1)
+        };
+        let other_shape = place(0, &smaller);
+        assert!(host_raw(other_shape).is_some());
+        assert_ne!(host_raw(other_shape), host_raw(a), "another shape");
+        assert!(
+            SHARED[2].load(Relaxed) > before,
+            "counted as an alias of another shape"
+        );
+
+        // The host texture lives while any alias does.
+        let kept = host_raw(b);
+        assert_eq!(slot::<Release>(a, 0x10)(a), 0);
+        assert_eq!(host_raw(b), kept);
+        let c = place(0, &target);
+        assert_eq!(host_raw(c), kept);
+        for r in [b, c, sampled, elsewhere, other_shape] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
+    }
+
+    /// Pages of "physical memory" the test resolver knows: address, length,
+    /// allocation id.
+    #[cfg(windows)]
+    static TEST_PAGES: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+    #[cfg(windows)]
+    fn test_physical(at: u64) -> Option<(u64, u64)> {
+        let pages = TEST_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        pages
+            .iter()
+            .find(|&&(base, len, _)| (base..base + len).contains(&at))
+            .map(|&(base, _, allocation)| (allocation, at - base))
+    }
+
+    /// Two render targets at different addresses over the same physical
+    /// pages (`XMemMapPhysicalPages` at two addresses) share one host
+    /// texture; one at an address of other pages does not.
+    #[cfg(windows)]
+    #[test]
+    fn render_targets_on_one_physical_page_share_one_host_texture() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        use_physical_resolver(test_physical);
+        assert_eq!(
+            PHYSICAL_RESOLVER.get().map(|&f| f as usize),
+            Some(test_physical as PhysicalResolver as usize)
+        );
+        let len = 4 * KIB_64;
+        let views: Vec<Vec<u8>> = (0..3).map(|_| vec![0u8; len as usize]).collect();
+        let at: Vec<u64> = views.iter().map(|v| v.as_ptr() as u64).collect();
+        {
+            let mut pages = TEST_PAGES.lock().unwrap();
+            pages.push((at[0], len, 0x5eed));
+            pages.push((at[1], len, 0x5eed));
+            pages.push((at[2], len, 0x0dd));
+        }
+        let target = ResourceDesc {
+            flags: RENDER_TARGET,
+            ..texture(256, 256, RGBA8_UNORM, 1)
+        };
+        let null = std::ptr::null();
+        let make = |address| {
+            let mut out = null;
+            let hr = create_at_address(
+                null,
+                address,
+                &target,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            );
+            assert_eq!(hr, S_OK);
+            out
+        };
+        let [a, b, c] = [make(at[0]), make(at[1]), make(at[2])];
+        assert!(host_raw(a).is_some());
+        assert_eq!(host_raw(a), host_raw(b), "one physical page, two addresses");
+        assert_ne!(host_raw(a), host_raw(c), "other pages");
+        // Sampling the second address through a view without a resource
+        // object (device 0x230) reads the same host texture.
+        // The description as the title's words (padding zero).
+        let words = |d: &ResourceDesc| {
+            let mut w = [0u32; 14];
+            w[0] = d.dimension;
+            [w[4], w[5]] = [d.width as u32, (d.width >> 32) as u32];
+            w[6] = d.height;
+            w[7] = u32::from(d.depth_or_array_size) | u32::from(d.mip_levels) << 16;
+            w[8..13].copy_from_slice(&[
+                d.format,
+                d.sample_count,
+                d.sample_quality,
+                d.layout,
+                d.flags,
+            ]);
+            w
+        };
+        let sampled = texture_at(at[1], &words(&texture(256, 256, RGBA8_UNORM, 1)));
+        assert_eq!(sampled.and_then(host_raw), host_raw(a));
+        for r in [a, b, c] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+        TEST_PAGES.lock().unwrap().clear();
     }
 }

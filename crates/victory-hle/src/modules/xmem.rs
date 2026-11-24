@@ -688,6 +688,22 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// The physical memory shown at `at`, if physical pages are mapped there:
+/// an id of the pages' allocation and the byte offset in it, the same at
+/// every address they are mapped at (`victory_gpu`: resources over the same
+/// pages share one host texture).
+pub fn physical_at(at: u64) -> Option<(u64, u64)> {
+    let at = usize::try_from(at).ok()?;
+    let physical = physical();
+    let (&base, (len, slice)) = physical.views.range(..=at).next_back()?;
+    (at < base + len).then(|| {
+        (
+            Arc::as_ptr(&slice.section) as u64,
+            (slice.index * PAGE + (at - base)) as u64,
+        )
+    })
+}
+
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
@@ -1075,6 +1091,12 @@ mod tests {
         assert!(write_physical(&pages[2..], 1, &[9]));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
+        // Both addresses of a page name the same physical memory.
+        let physical = |p: *mut c_void| physical_at(p as u64 + 5);
+        assert!(physical(at(a, 2)).is_some());
+        assert_eq!(physical(at(a, 2)), physical(at(b, 1)));
+        assert_ne!(physical(a), physical(at(a, 2)));
+        assert_eq!(physical(b), None);
 
         // Unmapping the middle page keeps its neighbours.
         assert_eq!(
