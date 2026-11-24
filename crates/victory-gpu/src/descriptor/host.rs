@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -25,7 +26,9 @@ pub(crate) struct HostHeap {
     spare: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    made: Vec<AtomicU64>,
+    /// Serializes writes to `made` / host descriptors on the slow path.
+    write_lock: Mutex<()>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -164,7 +167,8 @@ impl HostHeap {
             count,
             spare: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            write_lock: Mutex::new(()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
         };
@@ -452,31 +456,36 @@ impl HostHeap {
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        // Generations start at 1, so a made slot's key is never 0.
-        let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
-                self.make_null(index);
+            if self.made[index as usize].load(Ordering::Acquire) != 0 {
+                let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+                if self.made[index as usize].load(Ordering::Relaxed) != 0 {
+                    self.made[index as usize].store(0, Ordering::Release);
+                    self.make_null(index);
+                }
             }
             return None;
         };
-        if made[index as usize] != key {
-            let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
-            } else {
-                make(&view, self.cpu(index))
-            };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+        // Generations start at 1, so a made slot's key is never 0.
+        let key = u64::from(generation) << 32 | u64::from(i);
+        if self.made[index as usize].load(Ordering::Acquire) != key {
+            let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if self.made[index as usize].load(Ordering::Relaxed) != key {
+                let later = !for_draw && view.is_buffer();
+                let kept = if later {
+                    None
+                } else {
+                    make(&view, self.cpu(index))
+                };
+                if kept.is_none() && !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, kept.flatten());
+                self.made[index as usize].store(if later { 0 } else { key }, Ordering::Release);
             }
-            self.keep(index, kept.flatten());
         }
         Some(view)
     }
@@ -486,7 +495,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = self.made.get(index as usize)?.load(Ordering::Acquire);
         if key == 0 {
             return Some("null".into());
         }

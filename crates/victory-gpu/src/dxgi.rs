@@ -219,10 +219,22 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
+/// The console's mode list: one 60 Hz mode (default `1920x1080`; set
+/// `VICTORY_FORCE_1080P=0` for `3840x2160`). Grand Theft Auto VI sizes its
+/// swapchain from the mode returned here.
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
+fn requested_resolution() -> (u32, u32) {
+    let force_1080p = std::env::var("VICTORY_FORCE_1080P")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if force_1080p {
+        (1920, 1080)
+    } else {
+        (3840, 2160)
+    }
+}
+
 extern "system" fn modes(
     _: This,
     _format: u32,
@@ -241,10 +253,19 @@ extern "system" fn modes(
     if *count < 1 {
         return MORE_DATA;
     }
+    let (width, height) = requested_resolution();
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            width,
+            height,
+            "title queried overridden DXGI display mode"
+        );
+    }
     *count = 1;
     let mode = Mode {
-        width: 3840,
-        height: 2160,
+        width,
+        height,
         refresh: [60, 1],
         format: 0,
         scanlines: 1, // progressive
@@ -315,5 +336,23 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+    }
+
+    #[test]
+    fn output_mode_list_reports_requested_resolution() {
+        type Modes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
+        let output = &raw const OUTPUT_OBJECT as This;
+        let get_modes = slot::<Modes>(output, 0xa8);
+
+        let mut count = 0u32;
+        assert_eq!(get_modes(output, 0, 0, &mut count, std::ptr::null_mut()), S_OK);
+        assert_eq!(count, 1);
+
+        let mut mode = std::mem::MaybeUninit::<Mode>::uninit();
+        assert_eq!(get_modes(output, 0, 0, &mut count, mode.as_mut_ptr()), S_OK);
+        // SAFETY: written above.
+        let mode = unsafe { mode.assume_init() };
+        assert_eq!((mode.width, mode.height), requested_resolution());
+        assert_eq!(mode.refresh, [60, 1]);
     }
 }

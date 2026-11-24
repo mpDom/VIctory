@@ -89,6 +89,52 @@ fn give_back(buffers: impl IntoIterator<Item = Box<[u8]>>) {
     }
 }
 
+/// Merges GPU writes (`host != old`) into `title` while syncing title writes
+/// back into `host` and `old`. Processes 8 bytes at a time so unchanged words
+/// skip all writes to `host` and `old` (avoiding cache-line dirtying across
+/// multi-megabyte shadow buffers).
+fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    let len = title.len();
+    while i + 8 <= len {
+        let h = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
+        let o = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
+        let t = u64::from_ne_bytes(title[i..i + 8].try_into().unwrap());
+        if h == o {
+            if t != h {
+                let bytes = t.to_ne_bytes();
+                host[i..i + 8].copy_from_slice(&bytes);
+                old[i..i + 8].copy_from_slice(&bytes);
+            }
+        } else {
+            for k in i..i + 8 {
+                let hk = host[k];
+                if hk != old[k] && title[k] != hk {
+                    title[k] = hk;
+                    changed = true;
+                }
+                let tk = title[k];
+                host[k] = tk;
+                old[k] = tk;
+            }
+        }
+        i += 8;
+    }
+    while i < len {
+        let hk = host[i];
+        if hk != old[i] && title[i] != hk {
+            title[i] = hk;
+            changed = true;
+        }
+        let tk = title[i];
+        host[i] = tk;
+        old[i] = tk;
+        i += 1;
+    }
+    changed
+}
+
 const NOT_WATCHED: u8 = 2;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -249,15 +295,7 @@ impl Shadow {
                     // takes the title's bytes in turn, and so does the
                     // snapshot: to a later range that overlaps this one,
                     // they are not a shader's write to put back.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                        *o = *t;
-                    }
+                    let changed = merge_gpu_writes(title, host, old);
                     if changed {
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
