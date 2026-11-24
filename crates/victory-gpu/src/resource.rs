@@ -1429,7 +1429,7 @@ fn host_texture(
         return None;
     }
     let host = crate::host::host()?;
-    let mut d = host_desc(desc);
+    let d = host_desc(desc);
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
