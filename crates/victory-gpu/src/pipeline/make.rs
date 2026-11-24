@@ -20,6 +20,7 @@
 //! `VICTORY_PSO_WAIT_MS` (`0..=5000`) overrides the per-frame budget for every
 //! frame (`0` disables synchronous waiting completely).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -32,6 +33,8 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
+    urgent: AtomicBool,
+    done: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// Per-pipeline wake pair so unrelated background compiles do not wake
     /// threads waiting on a different pipeline.
@@ -67,6 +70,8 @@ impl Pending {
             shaders,
             graphics,
             queued: AtomicBool::new(false),
+            urgent: AtomicBool::new(false),
+            done: AtomicBool::new(false),
             made: OnceLock::new(),
             wait_lock: Mutex::new(()),
             wait_done: Condvar::new(),
@@ -269,7 +274,7 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        start(p);
+        start(p, true);
         wait(p, crate::frame::current());
     }
     let made = p.made.get()?.as_ref();
@@ -286,7 +291,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// now and then.
 #[cfg(test)]
 pub(crate) fn made(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    start(p);
+    start(p, true);
     let deadline = Instant::now() + Duration::from_secs(120);
     while p.made.get().is_none() {
         assert!(Instant::now() < deadline, "a host pipeline was not made");
@@ -295,14 +300,22 @@ pub(crate) fn made(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
-/// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
+/// Queues `p` for the workers. Urgent (actively drawn/dispatched) pipelines
+/// jump to the front of the queue ahead of background `early` precompiles.
+fn start(p: &Arc<Pending>, urgent: bool) {
     if !p.queued.swap(true, Ordering::Relaxed) {
+        if urgent {
+            p.urgent.store(true, Ordering::Relaxed);
+        }
         PEAK.fetch_max(
             WAITING.fetch_add(1, Ordering::Relaxed) + 1,
             Ordering::Relaxed,
         );
-        queue(p.clone());
+        queue(p.clone(), urgent);
+    } else if urgent && p.made.get().is_none() && !p.urgent.swap(true, Ordering::Relaxed) {
+        // Already queued as a low-priority `early` compile: promote to front
+        // so live draws are never starved behind thousands of background PSOs.
+        queue(p.clone(), true);
     }
 }
 
@@ -311,7 +324,7 @@ fn start(p: &Arc<Pending>) {
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p);
+        start(p, false);
     }
 }
 
@@ -342,28 +355,38 @@ fn wait(p: &Pending, frame: u64) {
     FRAME_BUDGET.refund(frame, reserved_us - elapsed_us);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
-    let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let receiver = Arc::new(Mutex::new(receiver));
+/// Hands `p` to the workers (up to `cores - 2`, 2..=12), started on first use.
+/// Urgent pipelines are pushed to the front so live draws never wait behind
+/// background `early` precompiles.
+fn queue(p: Arc<Pending>, urgent: bool) {
+    static QUEUE: OnceLock<Arc<(Mutex<VecDeque<Arc<Pending>>>, Condvar)>> = OnceLock::new();
+    let shared = QUEUE.get_or_init(|| {
+        let shared = Arc::new((Mutex::new(VecDeque::<Arc<Pending>>::new()), Condvar::new()));
         let workers = std::thread::available_parallelism()
             .map_or(2, |n| n.get().saturating_sub(2).clamp(2, 12));
         for i in 0..workers {
-            let receiver = receiver.clone();
+            let shared = shared.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
+                    let (lock, cv) = &*shared;
                     loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
-                        p.make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
+                        let p = {
+                            let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            while q.is_empty() {
+                                q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                            }
+                            q.pop_front().unwrap()
+                        };
+                        if p.made.get().is_none() {
+                            p.make();
+                        }
+                        if !p.done.swap(true, Ordering::Relaxed) {
+                            if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                                drained();
+                            } else {
+                                super::library::save(false);
+                            }
                         }
                     }
                 });
@@ -371,13 +394,18 @@ fn queue(p: Arc<Pending>) {
                 tracing::warn!(error = %e, "no pipeline worker");
             }
         }
-        sender
+        shared
     });
-    if let Err(e) = sender.send(p) {
-        // No worker: made here instead.
-        e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
+    let (lock, cv) = &**shared;
+    {
+        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if urgent {
+            q.push_front(p);
+        } else {
+            q.push_back(p);
+        }
     }
+    cv.notify_one();
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
