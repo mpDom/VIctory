@@ -969,6 +969,28 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        // Detile and upload newly-bound bindless (`ResourceDescriptorHeap[]`)
+        // streamed textures before the title's command lists sample them.
+        let pending_tex = crate::descriptor::host::take_bindless_textures(32);
+        let _bindless_upload = if !pending_tex.is_empty()
+            && let Ok(upload_list) = self.new_list()
+        {
+            const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+            for (res, tex) in &pending_tex {
+                let res = *res as crate::object::This;
+                crate::texture::upload(&upload_list, res, tex);
+                crate::list::ensure_state(&upload_list, res, SHADER_RESOURCE);
+            }
+            upload_list.close();
+            upload_list.run_deferred(&mut batch);
+            if let Some(prelude) = upload_list.prelude() {
+                lists.push(Some(prelude));
+            }
+            lists.push(upload_list.list.cast().ok());
+            Some(upload_list)
+        } else {
+            None
+        };
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());

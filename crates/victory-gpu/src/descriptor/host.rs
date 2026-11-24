@@ -861,6 +861,43 @@ pub(crate) fn adapt_view_format(
     true
 }
 
+struct PendingBindless {
+    seen: std::collections::HashSet<usize>,
+    queue: std::collections::VecDeque<(usize, ID3D12Resource)>,
+}
+
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for PendingBindless {}
+
+static BINDLESS_TEX: Mutex<Option<PendingBindless>> = Mutex::new(None);
+
+fn note_bindless_texture(resource: crate::object::This, texture: &ID3D12Resource) {
+    if resource.is_null() || !crate::texture::title_written(texture) {
+        return;
+    }
+    let key = resource as usize;
+    let mut guard = BINDLESS_TEX.lock().unwrap_or_else(|e| e.into_inner());
+    let state = guard.get_or_insert_with(|| PendingBindless {
+        seen: std::collections::HashSet::new(),
+        queue: std::collections::VecDeque::new(),
+    });
+    if state.seen.insert(key) {
+        state.queue.push_back((key, texture.clone()));
+    }
+}
+
+/// Drains up to `limit` newly-bound bindless `title_written` textures so
+/// `Host::execute` can detile and upload them before shaders sample
+/// `ResourceDescriptorHeap[]`.
+pub(crate) fn take_bindless_textures(limit: usize) -> Vec<(usize, ID3D12Resource)> {
+    let mut guard = BINDLESS_TEX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(state) = guard.as_mut() else {
+        return Vec::new();
+    };
+    let n = state.queue.len().min(limit);
+    state.queue.drain(..n).collect()
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -946,6 +983,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
+                note_bindless_texture(resource, texture);
                 Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
