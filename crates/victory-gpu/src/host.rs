@@ -971,8 +971,8 @@ impl Host {
         let mut batch = Batch::default();
         // Detile and upload newly-bound bindless (`ResourceDescriptorHeap[]`)
         // streamed textures before the title's command lists sample them.
-        let pending_tex = crate::descriptor::host::take_bindless_textures(32);
-        let _bindless_upload = if !pending_tex.is_empty()
+        let pending_tex = crate::descriptor::host::take_bindless_textures(16);
+        let bindless_upload = if !pending_tex.is_empty()
             && let Ok(upload_list) = self.new_list()
         {
             const SHADER_RESOURCE: u32 = 0x40 | 0x80;
@@ -1045,6 +1045,10 @@ impl Host {
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
+        drop(bindless_upload);
+        for (res, _) in &pending_tex {
+            crate::texture::forget(*res);
+        }
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
