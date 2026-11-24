@@ -6,7 +6,7 @@
 //! atomically; an entry that does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to [`encode`] and [`decode`] too (entries of older builds
+//! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
 //!
 //! A container this build cannot translate is cached too, as its error:
@@ -174,7 +174,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 /// The entry of a container that does not translate: this, then the
 /// error's text (UTF-8).
 const FAILED: &[u8; 4] = b"VSF1";
@@ -261,10 +261,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.stride_table));
     out
 }
 
@@ -321,6 +322,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let root_uavs = r.list()?;
+    let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -329,6 +332,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        root_uavs,
+        stride_table,
     })
 }
 
@@ -355,6 +360,8 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            root_uavs: vec![1],
+            stride_table: true,
         }
     }
 
@@ -379,7 +386,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);

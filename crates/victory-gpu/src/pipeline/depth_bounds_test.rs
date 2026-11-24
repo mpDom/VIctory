@@ -64,6 +64,8 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            stride_table: false,
         },
         used: Vec::new(),
     }));
@@ -166,7 +168,7 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     let null = std::ptr::null();
     let mut pso = null;
     assert_eq!(create_stream(null, &desc, &PIPELINE_IIDS[0], &mut pso), S_OK);
-    assert_eq!(host_pipeline(pso).expect("host refused the depth bounds pipeline").mesh, mesh);
+    assert_eq!(super::test_host_pipeline(pso).expect("host refused the depth bounds pipeline").mesh, mesh);
 
     let mut allocator = null;
     let mut list = null;

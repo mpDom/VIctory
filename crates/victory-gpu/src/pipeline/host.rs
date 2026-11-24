@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -183,7 +183,12 @@ impl GraphicsState {
             .map(|(e, name)| {
                 format!(
                     "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate
                 )
             })
             .collect();
@@ -280,6 +285,22 @@ pub(crate) fn bounded_root_srvs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
 }
 
+/// Whether root UAVs are bound as one-view tables of the buffer's host
+/// copy rather than root descriptors. A root descriptor has no size: a
+/// store or load past the copy is a GPU fault or hang, where the console's
+/// view has a record count (stores past it are dropped, loads return
+/// zeros) and its programs rely on that; their offsets come from title
+/// data, which is stale or zero when an earlier pass was dropped. The
+/// view covers the range a bind refreshes and copies back to title memory,
+/// so no store lands outside what the title gets back. Set
+/// `VICTORY_ROOT_UAV_DIRECT=1` to go back; a switch of its own, apart from
+/// `VICTORY_ROOT_SRV_DIRECT`, so that a run can tell which of the two
+/// changes what it sees.
+pub(crate) fn bounded_root_uavs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_UAV_DIRECT").is_none())
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -288,6 +309,9 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
+    pub(crate) stride_table: Option<u32>,
 }
 
 impl Stage {
@@ -326,6 +350,10 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
+    pub(crate) fn has_root_uavs(&self) -> bool {
+        self.stages.iter().any(|s| !s.root_uavs.is_empty())
+    }
+
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
@@ -363,7 +391,10 @@ impl HostPipeline {
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+            return refuse(
+                "the host GPU has no mesh shaders (or no shader model 6.6)",
+                shaders,
+            );
         }
         for (s, _) in &stages {
             s.translated()?;
@@ -377,6 +408,7 @@ impl HostPipeline {
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut root_views: Vec<((i32, u8), u32)> = Vec::new();
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
@@ -384,6 +416,8 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                stride_table: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -410,6 +444,11 @@ impl HostPipeline {
                     &t.root_srvs,
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
+                ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
                 ),
             ] {
                 for &slot in slots {
@@ -439,19 +478,35 @@ impl HostPipeline {
                         });
                         continue;
                     }
-                    out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
+                    let param = if kind == D3D12_ROOT_PARAMETER_TYPE_UAV && bounded_root_uavs() {
+                        push_root_uav_table(
+                            &mut params,
+                            &mut ranges,
+                            &mut root_views,
+                            slot,
+                            visibility,
+                        )
+                    } else {
+                        push_root_view(&mut params, &mut root_views, kind, slot, visibility)
+                    };
+                    if !out.contains(&(slot, param)) {
+                        out.push((slot, param));
+                    }
                 }
+            }
+            if t.stride_table {
+                stage.stride_table = Some(params.len() as u32);
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: STRIDE_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
@@ -472,13 +527,14 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
-            Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
-            }
-        };
+        let (root, root_blob) =
+            match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+                Ok(root) => root,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                    return None;
+                }
+            };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -775,7 +831,10 @@ fn stream_pipeline<S, D>(
         stages,
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+        mask: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+            g.sample_mask,
+        ),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth,
         targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
@@ -802,7 +861,96 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         return Vec::new();
     }
     // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }
+        .to_vec()
+}
+
+/// Adds or reuses a root view parameter for `(kind, slot)`, widening its
+/// visibility to `ALL` when shared across multiple shader stages so shared
+/// root descriptors do not consume extra root signature dwords.
+fn push_root_view(
+    params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+    seen: &mut Vec<((i32, u8), u32)>,
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    slot: u8,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> u32 {
+    if let Some(existing) = shared_root_view(params, seen, kind, slot, visibility) {
+        return existing;
+    }
+    let index = params.len() as u32;
+    seen.push(((kind.0, slot), index));
+    params.push(D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: u32::from(slot),
+                RegisterSpace: ROOT_CBV_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: visibility,
+    });
+    index
+}
+
+/// The parameter an earlier stage added for `(kind, slot)`, its visibility
+/// widened to `ALL` if this stage's differs.
+fn shared_root_view(
+    params: &mut [D3D12_ROOT_PARAMETER1],
+    seen: &[((i32, u8), u32)],
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    slot: u8,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> Option<u32> {
+    let &(_, existing) = seen.iter().find(|&&(k, _)| k == (kind.0, slot))?;
+    if params[existing as usize].ShaderVisibility != visibility {
+        params[existing as usize].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    Some(existing)
+}
+
+/// Adds or reuses the parameter of root UAV `slot` as a one-view table
+/// (see [`bounded_root_uavs`]): one UAV range at the register and space
+/// the root descriptor had, so the shader is the same either way. Shared
+/// between stages as [`push_root_view`] shares a descriptor (the title
+/// sets one address for the slot, so one view serves every stage); a
+/// table costs one root signature dword where a descriptor costs two.
+/// `ranges` keeps the range alive until the root signature is made.
+fn push_root_uav_table(
+    params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+    ranges: &mut Vec<Box<D3D12_DESCRIPTOR_RANGE1>>,
+    seen: &mut Vec<((i32, u8), u32)>,
+    slot: u8,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> u32 {
+    let kind = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    if let Some(existing) = shared_root_view(params, seen, kind, slot, visibility) {
+        return existing;
+    }
+    let range = Box::new(D3D12_DESCRIPTOR_RANGE1 {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+        NumDescriptors: 1,
+        BaseShaderRegister: u32::from(slot),
+        RegisterSpace: ROOT_CBV_SPACE,
+        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+            | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+        OffsetInDescriptorsFromTableStart: 0,
+    });
+    let index = params.len() as u32;
+    seen.push(((kind.0, slot), index));
+    params.push(D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: &raw const *range,
+            },
+        },
+        ShaderVisibility: visibility,
+    });
+    ranges.push(range);
+    index
 }
 
 fn root_signature(
@@ -930,5 +1078,172 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+}
+
+#[cfg(test)]
+mod root_view_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIFactory4,
+    };
+
+    #[test]
+    fn root_views_deduplicate_across_stages_and_create_on_warp() {
+        let mut params = Vec::new();
+        let mut seen = Vec::new();
+
+        // Vertex stage declares CBV 0, SRV 1, UAV 2.
+        let v_cbv = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_CBV,
+            0,
+            D3D12_SHADER_VISIBILITY_VERTEX,
+        );
+        let v_srv = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            1,
+            D3D12_SHADER_VISIBILITY_VERTEX,
+        );
+        let v_uav = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            2,
+            D3D12_SHADER_VISIBILITY_VERTEX,
+        );
+        assert_eq!((v_cbv, v_srv, v_uav), (0, 1, 2));
+        assert_eq!(params[2].ShaderVisibility, D3D12_SHADER_VISIBILITY_VERTEX);
+
+        // Pixel stage shares CBV 0 and UAV 2, declares SRV 2 (same slot,
+        // different kind -> separate parameter), and pixel-only UAV 5.
+        let p_cbv = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_CBV,
+            0,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+        );
+        let p_uav_shared = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            2,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+        );
+        let p_srv_same_slot = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            2,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+        );
+        let p_uav_only = push_root_view(
+            &mut params,
+            &mut seen,
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            5,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+        );
+
+        assert_eq!(p_cbv, v_cbv);
+        assert_eq!(p_uav_shared, v_uav);
+        assert_eq!(p_srv_same_slot, 3);
+        assert_eq!(p_uav_only, 4);
+        assert_eq!(params.len(), 5);
+        assert_eq!(params[0].ShaderVisibility, D3D12_SHADER_VISIBILITY_ALL);
+        assert_eq!(params[1].ShaderVisibility, D3D12_SHADER_VISIBILITY_VERTEX);
+        assert_eq!(params[2].ShaderVisibility, D3D12_SHADER_VISIBILITY_ALL);
+        assert_eq!(params[3].ShaderVisibility, D3D12_SHADER_VISIBILITY_PIXEL);
+        assert_eq!(params[4].ShaderVisibility, D3D12_SHADER_VISIBILITY_PIXEL);
+
+        // Create the root signature on WARP (and on host() when available).
+        // SAFETY: plain DXGI/D3D12 device creation on the WARP software adapter.
+        let warp_device = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>())
+                .and_then(|a| {
+                    let mut dev: Option<ID3D12Device> = None;
+                    D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut dev)?;
+                    dev.ok_or_else(windows::core::Error::empty)
+                })
+        };
+        if let Ok(dev) = warp_device {
+            root_signature(&dev, &params, &[], false)
+                .expect("WARP CreateRootSignature with deduplicated CBV/SRV/UAV root views");
+        }
+        if let Some(h) = host() {
+            root_signature(&h.device, &params, &[], false)
+                .expect("host CreateRootSignature with deduplicated CBV/SRV/UAV root views");
+        }
+    }
+
+    /// A root UAV as a one-view table is shared between the stages that
+    /// name it, as a root UAV descriptor is, and such a root signature is
+    /// made on WARP and on the host.
+    #[test]
+    fn root_uav_tables_deduplicate_across_stages_and_create_on_warp() {
+        let mut params = Vec::new();
+        let mut ranges = Vec::new();
+        let mut seen = Vec::new();
+        let (vertex, pixel) = (
+            D3D12_SHADER_VISIBILITY_VERTEX,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+        );
+        let uav = D3D12_ROOT_PARAMETER_TYPE_UAV;
+
+        // Vertex stage: CBV 0 (a descriptor), UAVs 2 and 3 (tables).
+        let cbv = push_root_view(&mut params, &mut seen, D3D12_ROOT_PARAMETER_TYPE_CBV, 0, vertex);
+        let v_uav = push_root_uav_table(&mut params, &mut ranges, &mut seen, 2, vertex);
+        let v_only = push_root_uav_table(&mut params, &mut ranges, &mut seen, 3, vertex);
+        // Pixel stage: shares UAV 2, has UAV 5 of its own.
+        let p_uav = push_root_uav_table(&mut params, &mut ranges, &mut seen, 2, pixel);
+        let p_only = push_root_uav_table(&mut params, &mut ranges, &mut seen, 5, pixel);
+        // A stage naming a slot twice gets the one parameter.
+        let again = push_root_uav_table(&mut params, &mut ranges, &mut seen, 5, pixel);
+
+        assert_eq!((cbv, v_uav, v_only, p_uav, p_only, again), (0, 1, 2, 1, 3, 3));
+        assert_eq!(params.len(), 4);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(params[1].ShaderVisibility, D3D12_SHADER_VISIBILITY_ALL);
+        assert_eq!(params[2].ShaderVisibility, vertex);
+        assert_eq!(params[3].ShaderVisibility, pixel);
+        assert_eq!(seen[1], ((uav.0, 2), 1));
+        for (param, slot) in [(1usize, 2u32), (2, 3), (3, 5)] {
+            let p = &params[param];
+            assert_eq!(p.ParameterType, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE);
+            // SAFETY: a table parameter, its range kept alive in `ranges`.
+            let range = unsafe {
+                assert_eq!(p.Anonymous.DescriptorTable.NumDescriptorRanges, 1);
+                &*p.Anonymous.DescriptorTable.pDescriptorRanges
+            };
+            assert_eq!(range.RangeType, D3D12_DESCRIPTOR_RANGE_TYPE_UAV);
+            assert_eq!(range.NumDescriptors, 1);
+            assert_eq!(range.BaseShaderRegister, slot);
+            assert_eq!(range.RegisterSpace, ROOT_CBV_SPACE);
+        }
+
+        // SAFETY: plain DXGI/D3D12 device creation on the WARP software adapter.
+        let warp_device = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>())
+                .and_then(|a| {
+                    let mut dev: Option<ID3D12Device> = None;
+                    D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut dev)?;
+                    dev.ok_or_else(windows::core::Error::empty)
+                })
+        };
+        if let Ok(dev) = warp_device {
+            root_signature(&dev, &params, &[], false)
+                .expect("WARP CreateRootSignature with root UAV tables");
+        }
+        if let Some(h) = host() {
+            root_signature(&h.device, &params, &[], false)
+                .expect("host CreateRootSignature with root UAV tables");
+        }
     }
 }

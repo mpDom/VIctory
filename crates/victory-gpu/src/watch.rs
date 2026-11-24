@@ -341,7 +341,8 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
-    open(&mut guards(), at, at + len);
+    // The length is the title's (`fread`'s size times count, saturated).
+    open(&mut guards(), at, at.saturating_add(len));
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -349,7 +350,7 @@ pub fn writing(at: usize, len: usize) {
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
-    let range = at / BLOCK..(at + len).div_ceil(BLOCK);
+    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
@@ -558,12 +559,16 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // The journal is keyed by address and outlives a freed allocation:
+        // memory a test beside this one freed may have been here, so pages
+        // may be listed already, but none as written at this asking.
+        let (first, before) = writes(start, end, false).expect("watched");
+        assert!(before.iter().all(|&(_, asked)| asked < first));
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        let fresh: Vec<_> = after.into_iter().filter(|&(_, w)| w >= first).collect();
+        assert_eq!(fresh, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
@@ -824,5 +829,15 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 3 * BLOCK);
+    }
+
+    /// A write or mapping that runs past the end of the address space (a
+    /// title's `fread` with a huge count) covers up to the end; the sum used
+    /// to overflow. Up there no test has guarded blocks.
+    #[test]
+    fn ranges_past_the_address_space_end_do_not_overflow() {
+        let top = usize::MAX - 16;
+        writing(top, PAGE);
+        title_memory_remapped(top, usize::MAX);
     }
 }

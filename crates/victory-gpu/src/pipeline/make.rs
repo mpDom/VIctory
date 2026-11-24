@@ -279,6 +279,22 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     made
 }
 
+/// The host pipeline once it is made, however long that takes (`None` if
+/// the host refused it). For tests: [`ready`] waits only within the
+/// frame's budget, which tests running beside one another share, so a test
+/// that draws right after creating a pipeline would have the draw dropped
+/// now and then.
+#[cfg(test)]
+pub(crate) fn made(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    start(p);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while p.made.get().is_none() {
+        assert!(Instant::now() < deadline, "a host pipeline was not made");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    p.made.get()?.as_ref()
+}
+
 /// Queues `p` for the workers, once.
 fn start(p: &Arc<Pending>) {
     if !p.queued.swap(true, Ordering::Relaxed) {

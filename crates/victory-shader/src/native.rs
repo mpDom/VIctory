@@ -199,7 +199,30 @@ impl NativeProgram {
         if self.stage == HwStage::Gs {
             return crate::geometry::invocation_ir(self);
         }
-        crate::ir::build(&self.patched_code(), self.wave64, self.vgprs)
+        // A compute program whose root arguments all sit past the 16 user
+        // SGPRs finds them through the spill table `s[0:1]` points to.
+        crate::ir::build_with(
+            &self.patched_code(),
+            self.wave64,
+            self.vgprs,
+            self.spilled(),
+        )
+    }
+
+    /// Whether the root arguments arrive through the spill table `s[0:1]`
+    /// points to: a compute program whose root parameters all sit past the
+    /// 16 user SGPRs. The table's dwords are numbered as user SGPRs from 16
+    /// up but are spill arguments of their own ([`crate::ir::Reg::Spill`]),
+    /// apart from the physical SGPRs of those numbers: a system SGPR (a
+    /// thread-group id component or the group info) at s16 or above, where
+    /// it sits after 16 user SGPRs, keeps its own value.
+    pub fn spilled(&self) -> bool {
+        self.stage == HwStage::Cs
+            && !self.layout.is_empty()
+            && self
+                .layout
+                .iter()
+                .all(|r| self.stage.user_sgpr(r.user_data) >= 16)
     }
 }
 
@@ -351,6 +374,15 @@ impl ComputeIo {
         };
         let ids = [take(7), take(8), take(9)];
         (ids, take(10))
+    }
+
+    /// SGPRs the hardware initializes: the user SGPRs, the enabled system
+    /// ones, then the scratch wave offset when scratch is enabled (bit 0).
+    /// The ones above hold whatever the previous wave left.
+    pub fn initialized_sgprs(&self) -> u8 {
+        let (ids, info) = self.system_sgprs();
+        let end = ids.into_iter().chain([info]).flatten().map(|s| s + 1).max();
+        end.unwrap_or(0).max(self.user_sgprs()) + (self.rsrc2 & 1) as u8
     }
 
     /// Thread id components in v0, v1, v2 (1 to 3). `TIDIG_COMP_CNT` is a
@@ -1096,6 +1128,70 @@ pub(crate) mod tests {
         assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (3, 0));
     }
 
+    /// A compute program with one root parameter at each user-data dword of
+    /// `at`, and `rsrc2` for its SGPR counts.
+    fn compute_with(at: &[u8], rsrc2: u32) -> NativeProgram {
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: at
+                .iter()
+                .enumerate()
+                .map(|(slot, &user_data)| RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data,
+                    slot: slot as u8,
+                })
+                .collect(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2,
+                threads: [1, 1, 1],
+            }),
+            code: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn spill_table_rule_needs_every_argument_past_the_user_sgprs() {
+        // All root arguments at user data 16 and up.
+        assert!(compute_with(&[16, 18], 16 << 1).spilled());
+        // One argument in a user SGPR: the program has a mixed layout.
+        assert!(!compute_with(&[4, 16], 16 << 1).spilled());
+        // No root parameter at all.
+        assert!(!compute_with(&[], 16 << 1).spilled());
+        // Another stage never uses the table.
+        let mut vs = compute_with(&[16], 16 << 1);
+        vs.stage = HwStage::Vs;
+        vs.io = StageIo::None;
+        assert!(!vs.spilled());
+    }
+
+    #[test]
+    fn spill_table_rule_holds_with_a_system_sgpr_at_s16() {
+        // 16 user SGPRs and the group id's x: it arrives in s16, the number
+        // table dword 0 has as a spill argument. The two are apart, so the
+        // rule applies.
+        let cs = compute_with(&[16, 18], 16 << 1 | 1 << 7);
+        let StageIo::Cs(io) = &cs.io else {
+            unreachable!()
+        };
+        assert_eq!(io.system_sgprs().0[0], Some(16));
+        assert!(cs.spilled());
+        // The group info alone, after 16 user SGPRs.
+        assert!(compute_with(&[16], 16 << 1 | 1 << 10).spilled());
+        // 12 user SGPRs: x, y, z and the info sit in s12 to s15.
+        assert!(compute_with(&[16], 12 << 1 | 0xF << 7).spilled());
+        // 13 user SGPRs: the info reaches s16.
+        assert!(compute_with(&[16], 13 << 1 | 0xF << 7).spilled());
+        // The system SGPRs do not make a mixed layout a spilled one.
+        assert!(!compute_with(&[4, 16], 16 << 1 | 1 << 7).spilled());
+    }
+
     #[test]
     fn thread_id_count_three_is_still_three_components() {
         // TIDIG_COMP_CNT (bits 11-12) of 3: still x, y and z in v0-v2,
@@ -1105,6 +1201,28 @@ pub(crate) mod tests {
             threads: [4, 4, 4],
         };
         assert_eq!(cs.thread_id_vgprs(), 3);
+    }
+
+    #[test]
+    fn initialized_sgprs_covers_user_system_and_scratch() {
+        // 5 user SGPRs, group ids x and y (s5, s6), no scratch: s0..=s6.
+        let cs = ComputeIo {
+            rsrc2: 0x1098A,
+            threads: [16, 16, 1],
+        };
+        assert_eq!(cs.initialized_sgprs(), 7);
+        // All three group ids after 6 user SGPRs, plus the info SGPR: s0..=s9.
+        let cs = ComputeIo {
+            rsrc2: 0x78C,
+            threads: [8, 8, 1],
+        };
+        assert_eq!(cs.initialized_sgprs(), 10);
+        // The same with scratch enabled adds the wave offset: s0..=s10.
+        let cs = ComputeIo {
+            rsrc2: 0x78D,
+            threads: [8, 8, 1],
+        };
+        assert_eq!(cs.initialized_sgprs(), 11);
     }
 
     #[test]

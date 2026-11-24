@@ -113,8 +113,7 @@ pub struct Resources {
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
-    /// User SGPRs holding root parameters: value on entry, layout index,
-    /// dword within the parameter.
+    /// Root arguments: value on entry, layout index, dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
 }
@@ -133,6 +132,9 @@ pub struct Waterfall {
     /// The `v_readfirstlane_b32` results they compare, each the lane's own
     /// source dword.
     pub reads: Vec<Value>,
+    /// Descriptor loads at a table offset among `reads` (the console
+    /// compiler's form): each lane loads its own entry.
+    pub loads: Vec<Site>,
 }
 
 /// Traces every descriptor and scalar address of `p`, which runs as
@@ -179,6 +181,10 @@ fn trace(t: Tracer, skipped: &[usize]) -> Result<Resources, ShaderError> {
     // Group accesses in the same loop so a shared mask can select several
     // descriptors together.
     let mut first_lane_at = std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>)>::new();
+    // The console compiler's waterfall reads the first lane's table offset
+    // and loads that entry: accesses, offset reads and loads by block.
+    let mut offset_at =
+        std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             if skipped.contains(&inst.machine.offset) {
@@ -190,9 +196,17 @@ fn trace(t: Tracer, skipped: &[usize]) -> Result<Resources, ShaderError> {
                 what,
             };
             let mut first_lane = Vec::new();
+            let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
+                if let Source::Loaded { load, .. } = source
+                    && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
+                    && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
+                    && t.first_lane_source(v).is_some()
+                {
+                    offset.push((v, load));
+                }
                 out.descriptors.push(Descriptor { site, role, source });
                 Ok(())
             };
@@ -234,6 +248,14 @@ fn trace(t: Tracer, skipped: &[usize]) -> Result<Resources, ShaderError> {
                 accesses.push(i);
                 reads.extend(first_lane);
             }
+            if !offset.is_empty() {
+                let (accesses, reads, loads) = offset_at.entry(b).or_default();
+                accesses.push(i);
+                for (v, load) in offset {
+                    reads.push(v);
+                    loads.push(load);
+                }
+            }
         }
     }
     // The proof needs the per-lane form. Without it nothing is emitted, and
@@ -252,6 +274,17 @@ fn trace(t: Tracer, skipped: &[usize]) -> Result<Resources, ShaderError> {
             })?;
         out.waterfall.compares.extend(proof.compares);
         out.waterfall.reads.extend(proof.reads);
+    }
+    // Unproven, an offset read stays the first lane's (one uniform entry),
+    // which is what the hardware reads outside a waterfall loop.
+    for (block, (accesses, mut reads, loads)) in offset_at {
+        reads.sort_unstable();
+        reads.dedup();
+        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
+            out.waterfall.compares.extend(proof.compares);
+            out.waterfall.reads.extend(proof.reads);
+            out.waterfall.loads.extend(loads);
+        }
     }
     Ok(out)
 }
@@ -431,7 +464,11 @@ impl<'a> Tracer<'a> {
 
     /// Layout index and dword of the root parameter `reg` holds on entry.
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
-        let Reg::S(code) = reg else { return None };
+        let code = match reg {
+            Reg::S(code) if !self.p.spilled => code,
+            Reg::Spill(code) => code,
+            _ => return None,
+        };
         self.layout.iter().enumerate().find_map(|(i, p)| {
             let first = self.stage.user_sgpr(p.user_data);
             let dword = u32::from(code).checked_sub(first.into())?;
@@ -639,7 +676,11 @@ impl<'a> Tracer<'a> {
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
+                let code = self.stage.user_sgpr(self.layout[param].user_data) + 1;
+                let high = match reg {
+                    Reg::Spill(_) => Reg::Spill(code),
+                    _ => Reg::S(code),
+                };
                 let input = self.p.inputs.iter().find(|i| i.0 == high);
                 Some(input.ok_or("a root descriptor without its high half")?.1)
             }
@@ -1671,6 +1712,7 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     }
     let src = src.first()?;
     match (inst.name(), *src) {
+        ("s_mov_b32", Operand::Spill(code)) => inst.read(Reg::Spill(code)).map(Moved::Value),
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
             inst.read(Reg::S(code + k as u8)).map(Moved::Value)
         }
@@ -1819,6 +1861,43 @@ pub(crate) mod tests {
         assert_eq!(
             r.params.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(),
             [(0, 0), (0, 1)]
+        );
+    }
+
+    #[test]
+    fn spilled_root_descriptor_uses_its_logical_high_half() {
+        let code: Vec<u8> = [
+            0xF404_0280u32, // s_load_dwordx2 s[10:11], s[0:1], 0
+            0xFA00_0000,
+            0xBE85_0311, // s_mov_b32 s5, physical s17
+            0x8801_FF0B,
+            0x0010_0000, // s_or_b32 s1, s11, 0x100000
+            0xBE80_030A, // s_mov_b32 s0, s10
+            0xBE82_03C1, // s_mov_b32 s2, -1
+            0xBE83_03FF,
+            0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+            0xF430_0000,
+            0xFA00_0000, // s_buffer_load_dwordx16 s[0:15], s[0:3], null
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build_with(&code, false, 256, true).unwrap();
+        assert!(p.inputs.iter().any(|&(reg, _)| reg == Reg::S(17)));
+        let r = track(&p, &[param(Descriptor, 16, 2)], HwStage::Cs, lanes(&p).as_ref()).unwrap();
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(0, 0),
+                bits: 0x10_0000,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+        let input = |reg| p.inputs.iter().find(|&&(r, _)| r == reg).unwrap().1;
+        assert_eq!(
+            r.params,
+            [(input(Reg::Spill(16)), 0, 0), (input(Reg::Spill(17)), 0, 1)]
         );
     }
 
@@ -2252,6 +2331,64 @@ pub(crate) mod tests {
         0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ];
+
+    /// The console compiler's waterfall (Grand Theft Auto VI's ray-tracing
+    /// resolve and others): each lane holds its entry's byte offset in the
+    /// table at s0 (v7 = (lane & 1) * 32); the loop reads the first active
+    /// lane's offset, narrows EXEC to the lanes with the same one
+    /// (`v_cmpx_eq_u32`), loads that entry with `s_load_dwordx8` and samples,
+    /// then drops those lanes (`s_andn2_wrexec_b32`). The sample goes to the
+    /// buffer at dword 16 of the table, at lane * 4.
+    pub(crate) const WATERFALL_INDEXED_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // 0x40: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> 0x40
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn the_console_waterfall_over_a_first_lane_offset_is_one() {
+        let r = waterfall(WATERFALL_INDEXED_WAVE32, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        let (_, address) = r.scalar.iter().find(|s| s.0 == load).unwrap();
+        assert!(address.dynamic.is_some(), "{address:?}");
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
 
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes
     /// below 16 load table entry (lane & 1) with two `global_load_dwordx4`,

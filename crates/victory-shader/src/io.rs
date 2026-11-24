@@ -190,6 +190,9 @@ pub struct Io {
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
+    /// Compute: how many SGPRs the hardware initializes
+    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
+    pub initialized_sgprs: Option<u8>,
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
@@ -301,6 +304,10 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
 
     let mut io = Io {
         inputs: inputs.clone(),
+        initialized_sgprs: match &native.io {
+            StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            _ => None,
+        },
         ..Io::default()
     };
     // Only a second interpolation half needs to trace SSA definitions.

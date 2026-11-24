@@ -6,7 +6,7 @@
 //! the table as a call.
 //!
 //! Each list records onto a host command list as its methods are called
-//! (decision 0007); draw state lives in [`crate::draw`]. Methods not
+//! (decision 0007); draw state lives in `crate::draw`. Methods not
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -459,6 +459,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::resource::skip_mixed_packed_copy("CopyResource", to, from) {
                 return;
             }
+            if crate::texture::title_written(from) {
+                crate::texture::upload(list, src, from);
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -563,7 +566,9 @@ fn prepare_footprint_upload(
         return Some((buffer, from, dst_bytes));
     }
     let (buffer, staging) = list.upload(host, bytes)?;
-    list.defer_copy(staging, data, bytes as usize);
+    // The list owns this mapped D3D12 upload buffer. Wine can report
+    // its address as MEM_FREE, so use the host-upload path.
+    list.defer_fill(staging, data, bytes as usize);
     from.resource = buffer.as_raw().cast_const().cast();
     from.footprint.offset = 0;
     Some((buffer, from, bytes))
@@ -622,6 +627,9 @@ extern "system" fn copy_texture_region(
             };
             if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
                 return;
+            }
+            if crate::texture::title_written(texture) {
+                crate::texture::upload(list, src.resource, texture);
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
@@ -1106,7 +1114,11 @@ mod state {
         views: *const VertexView,
     ) {
         with_state(this, |_, s| {
-            s.set_vertex_buffers(start, items(views, count))
+            if views.is_null() {
+                s.clear_vertex_buffers(start, count);
+            } else {
+                s.set_vertex_buffers(start, items(views, count));
+            }
         });
     }
     /// `(count, handles, one range, depth)`: with one range, the handles
