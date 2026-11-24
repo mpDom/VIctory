@@ -224,11 +224,14 @@ const _: () = assert!(size_of::<Mode>() == 32);
 /// swapchain from the mode returned here.
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
-fn requested_resolution() -> (u32, u32) {
-    let force_1080p = std::env::var("VICTORY_FORCE_1080P")
+pub(crate) fn force_1080p() -> bool {
+    std::env::var("VICTORY_FORCE_1080P")
         .map(|v| v != "0")
-        .unwrap_or(true);
-    if force_1080p {
+        .unwrap_or(true)
+}
+
+fn requested_resolution() -> (u32, u32) {
+    if force_1080p() {
         (1920, 1080)
     } else {
         (3840, 2160)

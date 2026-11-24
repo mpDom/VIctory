@@ -4,11 +4,14 @@
 //! On Series S (and Series X when FidelityFX is active), the title renders its
 //! 3D scene at a lower internal resolution (e.g. `1280x720`) and calls
 //! `ffxDispatch` to upscale to the display resolution (`1920x1080`). Rather
-//! than running the console's Xbox FSR compute shaders (which depend on
-//! console-specific shader features and may output black), this module answers
-//! the five `ffx*` exports directly and records a lightweight host D3D12
-//! bilinear compute upscale from `resources[0]` (color) to `resources[6]`
-//! (output).
+//! than running the console's Xbox FSR compute shaders, this module answers the
+//! five `ffx*` exports directly and records a lightweight host D3D12 bilinear
+//! compute upscale from `resources[0]` (color) to `resources[6]` (output).
+//!
+//! Supports both UAV-writable output formats (e.g. `R16G16B16A16_FLOAT`,
+//! `R11G11B10_FLOAT`, `R8G8B8A8_UNORM`) and `R9G9B9E5_SHAREDEXP` (format 67,
+//! which D3D12 does not allow direct UAV writes on) by packing into a matching
+//! `R32_UINT` scratch texture and issuing `CopyResource`.
 //!
 //! Enabled by default; set `VICTORY_FSR_SPATIAL=0` to disable and let the
 //! title load its own Xbox FidelityFX DLLs.
@@ -16,7 +19,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -50,6 +53,7 @@ const QUERY_GET_PROVIDER_VERSION: u64 = 6;
 
 const HOST_UNORDERED_ACCESS: u32 = 0x8;
 const HOST_NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+const HOST_COPY_DEST: u32 = 0x400;
 
 const OUTPUT: usize = 6;
 const RING_SLOTS: u32 = 64;
@@ -189,17 +193,61 @@ fn concrete_view_format(fmt: DXGI_FORMAT) -> DXGI_FORMAT {
     }
 }
 
+fn compile_cs(source: &str, name: windows::core::PCSTR) -> Option<Vec<u8>> {
+    let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+    // SAFETY: static source and entry/target strings; out pointers ours.
+    let compiled = unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            name,
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_0"),
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if let Err(e) = compiled {
+        let msg = errors
+            .as_ref()
+            .map(|b| unsafe {
+                let slice = std::slice::from_raw_parts(
+                    b.GetBufferPointer().cast::<u8>(),
+                    b.GetBufferSize(),
+                );
+                String::from_utf8_lossy(slice).into_owned()
+            })
+            .unwrap_or_default();
+        tracing::error!(error = %e, msg, "ffx: spatial compute shader failed to compile");
+        return None;
+    }
+    let blob = code?;
+    // SAFETY: valid compiled DXBC blob from D3DCompile.
+    Some(unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+            .to_vec()
+    })
+}
+
 struct SpatialPipeline {
     root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
+    pso_float4: ID3D12PipelineState,
+    pso_rgb9e5: ID3D12PipelineState,
     heap: ID3D12DescriptorHeap,
     stride: u32,
     next_slot: AtomicU32,
+    /// Scratch `R32_UINT` texture `(width, height, resource)` used when the
+    /// output is `R9G9B9E5_SHAREDEXP` (which forbids direct UAV writes).
+    rgb9e5_scratch: Mutex<Option<(u32, u32, ID3D12Resource)>>,
 }
 
 impl SpatialPipeline {
     fn new(device: &ID3D12Device) -> Option<Self> {
-        const SOURCE: &str = r#"
+        const FLOAT4_SRC: &str = r#"
             #define RS "RootConstants(num32BitConstants=4, b0), \
                         DescriptorTable(SRV(t0), UAV(u0)), \
                         StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, \
@@ -224,54 +272,65 @@ impl SpatialPipeline {
                 dst[id.xy] = src.SampleLevel(linearClamp, uv, 0.0);
             }
         "#;
-        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
-        // SAFETY: static source and entry/target strings; out pointers ours.
-        let compiled = unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("ffx_spatial"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_0"),
-                0,
-                0,
-                &mut code,
-                Some(&mut errors),
-            )
-        };
-        if let Err(e) = compiled {
-            let msg = errors
-                .as_ref()
-                .map(|b| unsafe {
-                    let slice = std::slice::from_raw_parts(
-                        b.GetBufferPointer().cast::<u8>(),
-                        b.GetBufferSize(),
-                    );
-                    String::from_utf8_lossy(slice).into_owned()
-                })
-                .unwrap_or_default();
-            tracing::error!(error = %e, msg, "ffx: spatial compute shader failed to compile");
-            return None;
-        }
-        let blob = code?;
-        // SAFETY: valid compiled DXBC blob from D3DCompile.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-        };
+        const RGB9E5_SRC: &str = r#"
+            #define RS "RootConstants(num32BitConstants=4, b0), \
+                        DescriptorTable(SRV(t0), UAV(u0)), \
+                        StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, \
+                            addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, \
+                            addressW=TEXTURE_ADDRESS_CLAMP)"
+            cbuffer Params : register(b0) {
+                uint2 renderSize;
+                uint2 upscaleSize;
+            };
+            Texture2D<float4> src : register(t0);
+            RWTexture2D<uint> dst : register(u0);
+            SamplerState linearClamp : register(s0);
+
+            uint pack_rgb9e5(float3 rgb) {
+                rgb = clamp(rgb, 0.0, 65408.0);
+                float maxc = max(rgb.r, max(rgb.g, rgb.b));
+                int exp_shared = max(-16, (int)floor(log2(max(maxc, 1e-10))) + 1) + 15;
+                float denom = exp2((float)(exp_shared - 15 - 9));
+                uint maxm = (uint)floor(maxc / denom + 0.5);
+                if (maxm == 512u) { denom *= 2.0; exp_shared += 1; }
+                uint rm = min(511u, (uint)floor(rgb.r / denom + 0.5));
+                uint gm = min(511u, (uint)floor(rgb.g / denom + 0.5));
+                uint bm = min(511u, (uint)floor(rgb.b / denom + 0.5));
+                return rm | (gm << 9) | (bm << 18) | ((uint)clamp(exp_shared, 0, 31) << 27);
+            }
+
+            [RootSignature(RS)]
+            [numthreads(8, 8, 1)]
+            void main(uint3 id : SV_DispatchThreadID) {
+                if (id.x >= upscaleSize.x || id.y >= upscaleSize.y) return;
+                uint srcW, srcH;
+                src.GetDimensions(srcW, srcH);
+                float2 scale = float2(renderSize) / float2(max(srcW, 1u), max(srcH, 1u));
+                float2 uv = ((float2(id.xy) + 0.5) / float2(upscaleSize)) * scale;
+                float3 rgb = src.SampleLevel(linearClamp, uv, 0.0).rgb;
+                dst[id.xy] = pack_rgb9e5(rgb);
+            }
+        "#;
+        let f4_bytes = compile_cs(FLOAT4_SRC, s!("ffx_spatial_f4"))?;
+        let r9_bytes = compile_cs(RGB9E5_SRC, s!("ffx_spatial_r9e5"))?;
+
         // SAFETY: valid device and embedded root signature in DXBC blob.
-        let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, bytes) }.ok()?;
-        let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
+        let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, &f4_bytes) }.ok()?;
+        let make_pso = |bytes: &[u8]| -> Option<ID3D12PipelineState> {
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            };
+            // SAFETY: valid root signature and compute shader bytecode.
+            unsafe { device.CreateComputePipelineState(&desc) }.ok()
         };
-        // SAFETY: valid root signature and compute shader bytecode.
-        let pso: ID3D12PipelineState = unsafe { device.CreateComputePipelineState(&pso_desc) }.ok()?;
+        let pso_float4 = make_pso(&f4_bytes)?;
+        let pso_rgb9e5 = make_pso(&r9_bytes)?;
+
         let heap_desc = D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             NumDescriptors: RING_SLOTS * 2,
@@ -286,11 +345,63 @@ impl SpatialPipeline {
         };
         Some(Self {
             root,
-            pso,
+            pso_float4,
+            pso_rgb9e5,
             heap,
             stride,
             next_slot: AtomicU32::new(0),
+            rgb9e5_scratch: Mutex::new(None),
         })
+    }
+
+    fn get_rgb9e5_scratch(
+        &self,
+        device: &ID3D12Device,
+        width: u32,
+        height: u32,
+    ) -> Option<ID3D12Resource> {
+        let mut slot = self.rgb9e5_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((w, h, ref res)) = *slot
+            && w == width
+            && h == height
+        {
+            return Some(res.clone());
+        }
+        let heap_props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(width),
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut res: Option<ID3D12Resource> = None;
+        // SAFETY: standard committed DEFAULT texture creation.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &heap_props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut res,
+                )
+                .ok()?;
+        }
+        let res = res?;
+        *slot = Some((width, height, res.clone()));
+        Some(res)
     }
 
     fn dispatch(
@@ -301,7 +412,29 @@ impl SpatialPipeline {
         output: &ID3D12Resource,
         render_size: [u32; 2],
         upscale_size: [u32; 2],
-    ) {
+    ) -> bool {
+        // SAFETY: valid resources.
+        let (src_desc, dst_desc) = unsafe { (color.GetDesc(), output.GetDesc()) };
+        let is_rgb9e5 = dst_desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+        if !is_rgb9e5 && (dst_desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0 {
+            return false;
+        }
+        let scratch = if is_rgb9e5 {
+            let Some(s) = self.get_rgb9e5_scratch(device, dst_desc.Width as u32, dst_desc.Height)
+            else {
+                return false;
+            };
+            Some(s)
+        } else {
+            None
+        };
+        let uav_target = scratch.as_ref().unwrap_or(output);
+        let uav_format = if is_rgb9e5 {
+            DXGI_FORMAT_R32_UINT
+        } else {
+            concrete_view_format(dst_desc.Format)
+        };
+
         let pair = self.next_slot.fetch_add(1, Ordering::Relaxed) % RING_SLOTS;
         let base_idx = pair * 2;
         // SAFETY: valid heap and resources.
@@ -318,8 +451,6 @@ impl SpatialPipeline {
                 ptr: gpu_start.ptr + u64::from(base_idx * self.stride),
             };
 
-            let src_desc = color.GetDesc();
-            let dst_desc = output.GetDesc();
             let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: concrete_view_format(src_desc.Format),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -334,7 +465,7 @@ impl SpatialPipeline {
                 },
             };
             let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                Format: concrete_view_format(dst_desc.Format),
+                Format: uav_format,
                 ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
                 Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                     Texture2D: D3D12_TEX2D_UAV {
@@ -344,11 +475,15 @@ impl SpatialPipeline {
                 },
             };
             device.CreateShaderResourceView(color, Some(&srv_desc), srv_cpu);
-            device.CreateUnorderedAccessView(output, None, Some(&uav_desc), uav_cpu);
+            device.CreateUnorderedAccessView(uav_target, None, Some(&uav_desc), uav_cpu);
 
             list.SetDescriptorHeaps(&[Some(self.heap.clone())]);
             list.SetComputeRootSignature(&self.root);
-            list.SetPipelineState(&self.pso);
+            list.SetPipelineState(if is_rgb9e5 {
+                &self.pso_rgb9e5
+            } else {
+                &self.pso_float4
+            });
             let params = [
                 render_size[0],
                 render_size[1],
@@ -358,7 +493,38 @@ impl SpatialPipeline {
             list.SetComputeRoot32BitConstants(0, 4, params.as_ptr().cast(), 0);
             list.SetComputeRootDescriptorTable(1, table_gpu);
             list.Dispatch(upscale_size[0].div_ceil(8), upscale_size[1].div_ceil(8), 1);
+
+            if let Some(ref s) = scratch {
+                let to_copy = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(s.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        }),
+                    },
+                };
+                list.ResourceBarrier(&[to_copy]);
+                list.CopyResource(output, s);
+                let to_uav = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(s.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        }),
+                    },
+                };
+                list.ResourceBarrier(&[to_uav]);
+            }
         }
+        true
     }
 }
 
@@ -533,8 +699,19 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
     let (Some(host), Some(pipe)) = (crate::host::host(), pipeline()) else {
         return ERROR;
     };
+    // SAFETY: valid D3D12 resource.
+    let dst_desc = unsafe { output.GetDesc() };
+    let is_rgb9e5 = dst_desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
     crate::list::ensure_state(list, color_title, HOST_NON_PIXEL_SHADER_RESOURCE);
-    crate::list::ensure_state(list, output_title, HOST_UNORDERED_ACCESS);
+    crate::list::ensure_state(
+        list,
+        output_title,
+        if is_rgb9e5 {
+            HOST_COPY_DEST
+        } else {
+            HOST_UNORDERED_ACCESS
+        },
+    );
 
     let render_size = if d.render_size[0] > 0 && d.render_size[1] > 0 {
         d.render_size
@@ -546,26 +723,25 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
     let upscale_size = if d.upscale_size[0] > 0 && d.upscale_size[1] > 0 {
         d.upscale_size
     } else {
-        // SAFETY: valid D3D12 resource.
-        let desc = unsafe { output.GetDesc() };
-        [desc.Width as u32, desc.Height]
+        [dst_desc.Width as u32, dst_desc.Height]
     };
 
-    pipe.dispatch(&host.device, &list.list, color, output, render_size, upscale_size);
-    crate::list::forget_host_bindings(title_list);
-
-    static FIRST: std::sync::Once = std::sync::Once::new();
-    FIRST.call_once(|| {
-        // SAFETY: valid D3D12 resources.
-        let (src_fmt, dst_fmt) = unsafe { (color.GetDesc().Format.0, output.GetDesc().Format.0) };
-        tracing::info!(
-            render = ?render_size,
-            upscale = ?upscale_size,
-            src_fmt,
-            dst_fmt,
-            "ffx: spatial upscale recorded on host GPU"
-        );
-    });
+    if pipe.dispatch(&host.device, &list.list, color, output, render_size, upscale_size) {
+        crate::list::forget_host_bindings(title_list);
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            // SAFETY: valid D3D12 resource.
+            let src_fmt = unsafe { color.GetDesc().Format.0 };
+            tracing::info!(
+                render = ?render_size,
+                upscale = ?upscale_size,
+                src_fmt,
+                dst_fmt = dst_desc.Format.0,
+                rgb9e5_copy = is_rgb9e5,
+                "ffx: spatial upscale recorded on host GPU"
+            );
+        });
+    }
     OK
 }
 
@@ -586,10 +762,7 @@ mod tests {
             render_width: &mut rw,
             render_height: &mut rh,
         };
-        assert_eq!(
-            ffxQuery(std::ptr::null_mut(), (&raw mut q).cast()),
-            OK
-        );
+        assert_eq!(ffxQuery(std::ptr::null_mut(), (&raw mut q).cast()), OK);
         assert_eq!((rw, rh), (1280, 720));
     }
 

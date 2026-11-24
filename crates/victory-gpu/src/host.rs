@@ -2493,7 +2493,7 @@ impl Host {
         let &(primary, _) = planes.first()?;
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
-        let (format, use_compositor) = match swap_format(primary_desc.Format) {
+        let (format, mut use_compositor) = match swap_format(primary_desc.Format) {
             Some(f) if primary_desc.Format.0 != 10 && primary_desc.Format.0 != 24 => (f, false),
             _ if matches!(primary_desc.Format.0, 10 | 24 | 26) => {
                 (DXGI_FORMAT_R8G8B8A8_UNORM, true)
@@ -2510,6 +2510,11 @@ impl Host {
             let d = unsafe { tex.GetDesc() };
             width = width.max(d.Width as u32);
             height = height.max(d.Height);
+        }
+        if crate::dxgi::force_1080p() && (width > 1920 || height > 1080) {
+            width = 1920;
+            height = 1080;
+            use_compositor = true;
         }
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
