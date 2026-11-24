@@ -279,6 +279,8 @@ extern "system" fn present(
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let fallback_1440p = crate::capture::take_1440p_target();
     #[cfg(windows)]
     if planes > 0
         && !plane_parameters.is_null()
@@ -300,8 +302,6 @@ extern "system" fn present(
                 resources.push((resource, texture, state));
             }
         }
-        #[cfg(feature = "diagnostics")]
-        let fallback_1440p = crate::capture::take_1440p_target();
         if !resources.is_empty() {
             #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
             let mut sources: Vec<(&_, u32)> = resources
@@ -309,11 +309,16 @@ extern "system" fn present(
                 .map(|(_, tex, state)| (*tex, *state))
                 .collect();
             #[cfg(feature = "diagnostics")]
-            if let Some(ref copy) = fallback_1440p {
-                let state = crate::host::legal_state(
-                    &copy.texture,
-                    copy.state.load(Ordering::Relaxed),
-                );
+            if let Some(ref candidate) = fallback_1440p
+                // Only substitute an actual plane 0, not the first retained overlay.
+                && slice.first().is_some_and(|p| p.count != 0 && !p.resources.is_null()
+                    // SAFETY: the first plane's resource array is nonempty.
+                    && unsafe { *p.resources } == resources[0].0)
+                && can_replace_primary(&sources, &candidate.copy.texture)
+            {
+                let copy = &candidate.copy;
+                let state =
+                    crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     // SAFETY: a live host texture.
@@ -325,6 +330,12 @@ extern "system" fn present(
                         "VICTORY_PRESENT_1440P: presenting 2560x1440 world target as plane 0"
                     );
                 });
+                tracing::debug!(
+                    frame,
+                    original = ?resources[0].0,
+                    substitute = format_args!("{:#x}", candidate.resource),
+                    "PresentX primary substituted"
+                );
                 sources[0] = (&copy.texture, state);
             }
             let shown = host.present(&sources, frame);
@@ -341,6 +352,21 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+#[cfg(all(windows, feature = "diagnostics"))]
+fn can_replace_primary(
+    planes: &[(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)],
+    candidate: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    let Some(&(primary, _)) = planes.first() else {
+        return false;
+    };
+    // SAFETY: a live host texture.
+    let desc = unsafe { primary.GetDesc() };
+    desc.Width == 3840
+        && desc.Height == 2160
+        && planes.iter().all(|(texture, _)| *texture != candidate)
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -444,7 +470,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
@@ -584,5 +612,111 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+}
+
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod present_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn present_fallback_uses_completed_work_once_and_only_at_4k() {
+        if !crate::capture::present_1440p_on() {
+            return;
+        }
+        let host = crate::host::host().expect("test requires a D3D12 host");
+        let null = std::ptr::null();
+        let make = |width, height| {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: width,
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let iid = guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 4, 15, 0xad],
+            );
+            let mut out = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    0,
+                    null.cast(),
+                    &iid,
+                    &mut out,
+                ),
+                S_OK
+            );
+            out
+        };
+        let record = |list: &crate::host::HostList, r, color| {
+            crate::list::ensure_state(list, r, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+            let rtv = host.rtv(crate::resource::host_resource(r).unwrap(), None);
+            // SAFETY: live RTV in render-target state when the list executes.
+            unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
+            list.note_1440p_target(r);
+        };
+        let black = make(3840, 2160);
+        let overlay = make(3840, 2160);
+        let small = make(32, 32);
+        let red = make(2560, 1440);
+        let green = make(2560, 1440);
+        let list = host.new_list().unwrap();
+        let discarded = host.new_list().unwrap();
+        record(&list, black, [0.0, 0.0, 0.0, 1.0]);
+        record(&list, overlay, [0.0, 0.0, 0.5, 0.5]);
+        record(&list, small, [0.0, 1.0, 0.0, 1.0]);
+        record(&list, red, [1.0, 0.0, 0.0, 1.0]);
+        record(&discarded, green, [0.0, 1.0, 0.0, 1.0]);
+        list.close();
+        discarded.close();
+        assert!(crate::capture::take_1440p_target().is_none());
+        host.execute(&[&list]);
+        discarded.reset();
+        discarded.close();
+        host.execute(&[&discarded]);
+        let plane = |resources| Plane {
+            token: 0,
+            count: 1,
+            resources,
+            _rest: [0; 6],
+        };
+        let full = [plane(&black), plane(&overlay)];
+        assert_eq!(present(null, 2, full.as_ptr(), null.cast()), S_OK);
+        assert!(crate::capture::take_1440p_target().is_none());
+        assert_eq!(present(null, 2, full.as_ptr(), null.cast()), S_OK);
+
+        list.reset();
+        record(&list, red, [1.0, 0.0, 0.0, 1.0]);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(present(null, 1, &plane(&small), null.cast()), S_OK);
+        assert!(crate::capture::take_1440p_target().is_none());
+        for resource in [black, overlay, small, red, green] {
+            let release = object::slot::<extern "system" fn(This) -> u32>(resource, 0x10);
+            assert_eq!(release(resource), 0);
+        }
     }
 }
