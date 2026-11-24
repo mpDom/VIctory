@@ -273,6 +273,7 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            crate::queue::note_rtv_1440p(record.resource);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(texture, record.desc().as_ref()));

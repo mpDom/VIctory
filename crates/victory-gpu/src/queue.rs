@@ -231,6 +231,47 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(windows)]
+static LAST_1440P: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn present_1440p_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_1440P").is_some())
+}
+
+/// Notes a `2560x1440` color RTV bound via `OMSetRenderTargets` when
+/// `VICTORY_PRESENT_1440P` is set (only RTVs, skipping compute UAV clears).
+#[cfg(windows)]
+pub(crate) fn note_rtv_1440p(resource: This) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    if resource.is_null() || !present_1440p_on() {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    // SAFETY: a live host texture.
+    let d = unsafe { copy.texture.GetDesc() };
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.SampleDesc.Count == 1
+        && d.Width == 2560
+        && d.Height == 1440
+        && matches!(d.Format.0, 28 | 29 | 87 | 91)
+    {
+        *LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+    }
+}
+
+#[cfg(windows)]
+fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    if !present_1440p_on() {
+        return None;
+    }
+    LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -300,15 +341,12 @@ extern "system" fn present(
                 resources.push((resource, texture, state));
             }
         }
-        #[cfg(feature = "diagnostics")]
-        let fallback_1440p = crate::capture::take_1440p_target();
+        let fallback_1440p = take_1440p_target();
         if !resources.is_empty() {
-            #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
             let mut sources: Vec<(&_, u32)> = resources
                 .iter()
                 .map(|(_, tex, state)| (*tex, *state))
                 .collect();
-            #[cfg(feature = "diagnostics")]
             if let Some(ref copy) = fallback_1440p {
                 let state = crate::host::legal_state(
                     &copy.texture,
@@ -322,7 +360,7 @@ extern "system" fn present(
                         width = d.Width,
                         height = d.Height,
                         format = d.Format.0,
-                        "VICTORY_PRESENT_1440P: presenting 2560x1440 world target as plane 0"
+                        "VICTORY_PRESENT_1440P: presenting 2560x1440 RTV world target as plane 0"
                     );
                 });
                 sources[0] = (&copy.texture, state);

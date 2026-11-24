@@ -47,6 +47,13 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+#[cfg(test)]
+pub(crate) fn clear_test_range(start: usize, len: usize) {
+    let (first, last) = (start / PAGE, (start + len).div_ceil(PAGE));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.written.retain(|&p, _| !(first..last).contains(&p));
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the

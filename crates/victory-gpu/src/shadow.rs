@@ -672,6 +672,11 @@ mod tests {
             };
             assert!(!at.is_null());
             let base = at as usize;
+            // Populate demand-zero 4 KiB sub-pages before resetting watch state
+            // so initial reads inside `copy` do not fault them into write-watch.
+            // SAFETY: `at..at + 2 * PAGE` is newly committed read-write memory.
+            unsafe { at.cast::<u8>().write_bytes(0, 2 * PAGE) };
+            crate::watch::writes(base, base + 2 * PAGE, false);
             register(base, base as u64, 2 * PAGE as u64);
             let shadow = find(base as u64, 2 * PAGE as u64).unwrap();
             Some(Watched { base, shadow })
@@ -681,6 +686,7 @@ mod tests {
     impl Drop for Watched {
         fn drop(&mut self) {
             unregister(self.base, self.base as u64);
+            crate::watch::clear_test_range(self.base, 2 * PAGE);
             // SAFETY: allocated with VirtualAlloc in `new`.
             unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
         }
