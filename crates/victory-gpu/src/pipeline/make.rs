@@ -362,8 +362,14 @@ fn queue(p: Arc<Pending>, urgent: bool) {
     static QUEUE: OnceLock<Arc<(Mutex<VecDeque<Arc<Pending>>>, Condvar)>> = OnceLock::new();
     let shared = QUEUE.get_or_init(|| {
         let shared = Arc::new((Mutex::new(VecDeque::<Arc<Pending>>::new()), Condvar::new()));
-        let workers = std::thread::available_parallelism()
-            .map_or(2, |n| n.get().saturating_sub(2).clamp(2, 12));
+        let workers = std::env::var("VICTORY_PSO_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(2, |n| (n.get() / 3).clamp(2, 4))
+            })
+            .clamp(1, 12);
         for i in 0..workers {
             let shared = shared.clone();
             let spawned = std::thread::Builder::new()
