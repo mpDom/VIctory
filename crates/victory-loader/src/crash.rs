@@ -149,7 +149,28 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         }
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
+            [0x0f, 0x01, 0xfc] => {
+                let room = 0x1000 - (context.Rip as usize & 0xfff);
+                let mut bytes = [0u8; 12];
+                let n = room.min(bytes.len());
+                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
+                if let Some(pass) = clzero_loop(&bytes[..n]) {
+                    let limit = *gpr(context, pass.limit);
+                    let start = context.Rax;
+                    let lines = if start < limit {
+                        (limit - start).div_ceil(64)
+                    } else {
+                        1
+                    };
+                    ((start & !63) as *mut u8).write_bytes(0, (lines * 64) as usize);
+                    context.Rax = start.wrapping_add(lines * 64);
+                    let flags = cmp_flags(context.Rax, limit);
+                    context.EFlags = context.EFlags & !CMP_FLAGS | flags;
+                    context.Rip += pass.len as u64;
+                    return true;
+                }
+                ((context.Rax & !63) as *mut u8).write_bytes(0, 64)
+            }
             [0x0f, 0x01, 0xfa] => {}
             [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
             _ => {
@@ -190,6 +211,32 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         context.Rip += 3;
     }
     true
+}
+
+struct ClzeroLoop {
+    limit: u8,
+    len: usize,
+}
+
+fn clzero_loop(code: &[u8]) -> Option<ClzeroLoop> {
+    if code.len() < 12 || code[..3] != [0x0f, 0x01, 0xfc] || code[3..7] != [0x48, 0x83, 0xc0, 0x40]
+    {
+        return None;
+    }
+    let (rex, op, modrm) = (code[7], code[8], code[9]);
+    if rex & 0xf8 != 0x48 || modrm >> 6 != 3 {
+        return None;
+    }
+    let (reg, rm) = ((modrm >> 3) & 7, modrm & 7);
+    let limit = match op {
+        0x39 if rm == 0 && rex & 1 == 0 => reg | (rex & 4) << 1,
+        0x3b if reg == 0 && rex & 4 == 0 => rm | (rex & 1) << 3,
+        _ => return None,
+    };
+    if code[10] != 0x72 || code[11] != 0xf4 {
+        return None;
+    }
+    Some(ClzeroLoop { limit, len: 12 })
 }
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
@@ -716,6 +763,32 @@ mod tests {
     /// On an Intel CPU, the real instructions go through the vectored
     /// handler. On an AMD CPU they run natively, and the tests below test
     /// the emulation.
+    #[test]
+    fn clzero_loops() {
+        let a = clzero_loop(&[
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4,
+        ])
+        .unwrap();
+        assert_eq!((a.limit, a.len), (10, 12));
+        let b = clzero_loop(&[
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xd0, 0x72, 0xf4,
+        ])
+        .unwrap();
+        assert_eq!(b.limit, 2);
+        let c = clzero_loop(&[
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x49, 0x3b, 0xc1, 0x72, 0xf4,
+        ])
+        .unwrap();
+        assert_eq!(c.limit, 9);
+        assert!(
+            clzero_loop(&[
+                0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x76, 0xf4
+            ])
+            .is_none()
+        );
+        assert!(clzero_loop(&[0x0f, 0x01, 0xfc]).is_none());
+    }
+
     #[test]
     fn clwb_loops() {
         // clwb [rcx]; add rcx, 0x40; cmp rcx, rax; jbe top
