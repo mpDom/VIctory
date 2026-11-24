@@ -2493,9 +2493,16 @@ impl Host {
         let &(primary, _) = planes.first()?;
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
-        let Some(format) = swap_format(primary_desc.Format) else {
-            tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
-            return None;
+        let (format, use_compositor) = match swap_format(primary_desc.Format) {
+            Some(f) if primary_desc.Format.0 != 10 && primary_desc.Format.0 != 24 => (f, false),
+            _ if matches!(primary_desc.Format.0, 10 | 24 | 26) => {
+                (DXGI_FORMAT_R8G8B8A8_UNORM, true)
+            }
+            Some(f) => (f, false),
+            None => {
+                tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
+                return None;
+            }
         };
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
         for &(tex, _) in &planes[1..] {
@@ -2537,7 +2544,7 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            let (capture, probe) = if planes.len() == 1 {
+            let (capture, probe) = if planes.len() == 1 && !use_compositor {
                 let (texture, state) = planes[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);

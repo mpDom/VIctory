@@ -250,18 +250,21 @@ fn present_world_on() -> bool {
     })
 }
 
-/// Notes a `>= 1280x720` color texture written via RTV or UAV when
-/// `VICTORY_PRESENT_WORLD` (or `VICTORY_PRESENT_1440P`) is set, preserving
-/// first-use order so F8/F9 can lock onto a specific 3D target without flicker.
+/// Notes a `>= 1280x720` color or HDR (`f10`/`f24`/`f26`) texture written via
+/// RTV or UAV when `VICTORY_PRESENT_WORLD` (or `VICTORY_PRESENT_1440P`) is set,
+/// preserving first-use order so F7/F8 can lock onto a specific 3D or cutscene
+/// target without flicker.
 #[cfg(windows)]
 pub(crate) fn note_world_target(resource: This) {
-    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+    };
     if resource.is_null() || !present_world_on() {
         return;
     }
     let key = resource as usize;
     let mut list = WORLD_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if list.len() >= 24 || list.iter().any(|&(k, _)| k == key) {
+    if list.len() >= 32 || list.iter().any(|&(k, _)| k == key) {
         return;
     }
     let Some(copy) = crate::resource::host_copy(resource) else {
@@ -271,9 +274,10 @@ pub(crate) fn note_world_target(resource: This) {
     let d = unsafe { copy.texture.GetDesc() };
     if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
         && d.SampleDesc.Count == 1
+        && d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
         && d.Width >= 1280
         && d.Height >= 720
-        && matches!(d.Format.0, 28 | 29 | 87 | 91)
+        && matches!(d.Format.0, 10 | 24 | 26 | 28 | 29 | 87 | 91)
     {
         list.push((key, copy));
     }
@@ -301,25 +305,26 @@ fn pick_world_target(
             (d.Width, d.Height) != (primary_w, primary_h)
         })
         .collect();
-    // Poll F8 (0x77 prev), F9 (0x78 next), F10 (0x79 normal) with edge trigger.
+    // Poll F6 (0x75 auto/normal), F7 (0x76 prev), F8 (0x77 next) with edge trigger.
+    // Avoids F9 (Discord mute).
     static LAST_KEYS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     // SAFETY: Win32 key-state query.
-    let (f8, f9, f10) = unsafe {
+    let (f6, f7, f8) = unsafe {
         (
+            (GetAsyncKeyState(0x75) as u16 & 0x8000) != 0,
+            (GetAsyncKeyState(0x76) as u16 & 0x8000) != 0,
             (GetAsyncKeyState(0x77) as u16 & 0x8000) != 0,
-            (GetAsyncKeyState(0x78) as u16 & 0x8000) != 0,
-            (GetAsyncKeyState(0x79) as u16 & 0x8000) != 0,
         )
     };
-    let bits = u8::from(f8) | (u8::from(f9) << 1) | (u8::from(f10) << 2);
+    let bits = u8::from(f6) | (u8::from(f7) << 1) | (u8::from(f8) << 2);
     let prev = LAST_KEYS.swap(bits, Ordering::Relaxed);
     let pressed = bits & !prev;
     let mut idx = WORLD_TARGET_IDX.lock().unwrap_or_else(|e| e.into_inner());
-    if pressed & 4 != 0 {
+    if pressed & 1 != 0 {
         *idx = None;
-        tracing::info!("VICTORY_PRESENT_WORLD: switched back to normal game output (F10)");
+        tracing::info!("VICTORY_PRESENT_WORLD: auto/normal mode (F6)");
     } else if !cands.is_empty() {
-        if pressed & 2 != 0 {
+        if pressed & 4 != 0 {
             let next = idx.map_or(0, |i| (i + 1) % cands.len());
             *idx = Some(next);
             // SAFETY: live host texture.
@@ -330,9 +335,9 @@ fn pick_world_target(
                 width = d.Width,
                 height = d.Height,
                 format = d.Format.0,
-                "VICTORY_PRESENT_WORLD: locked target (F9 next / F8 prev / F10 normal)"
+                "VICTORY_PRESENT_WORLD: locked target (F8 next / F7 prev / F6 auto)"
             );
-        } else if pressed & 1 != 0 {
+        } else if pressed & 2 != 0 {
             let next = idx.map_or(cands.len() - 1, |i| (i + cands.len() - 1) % cands.len());
             *idx = Some(next);
             // SAFETY: live host texture.
@@ -343,12 +348,20 @@ fn pick_world_target(
                 width = d.Width,
                 height = d.Height,
                 format = d.Format.0,
-                "VICTORY_PRESENT_WORLD: locked target (F9 next / F8 prev / F10 normal)"
+                "VICTORY_PRESENT_WORLD: locked target (F8 next / F7 prev / F6 auto)"
             );
         }
     }
-    let chosen = (*idx)?;
-    cands.get(chosen).or_else(|| cands.last()).cloned()
+    if let Some(chosen) = *idx {
+        return cands.get(chosen).or_else(|| cands.last()).cloned();
+    }
+    // Auto mode: prefer a decoded cutscene video target (height 736/1088) when
+    // present, otherwise leave normal swapchain output (menus/high-contrast).
+    cands.into_iter().find(|c| {
+        // SAFETY: live host texture.
+        let d = unsafe { c.texture.GetDesc() };
+        matches!(d.Height, 736 | 1088) && matches!(d.Format.0, 28 | 29 | 87 | 91)
+    })
 }
 
 #[cfg(feature = "diagnostics")]
