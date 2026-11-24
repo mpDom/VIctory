@@ -4382,7 +4382,7 @@ impl<'a> Lower<'a> {
 
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
-    /// typed loads do (channels past the format's read 0, 0, 0, 1).
+    /// typed loads do (channels past the format's read 0).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
     // bytes or more as dword-aligned. Norm formats divide, which the AMD
@@ -4490,14 +4490,7 @@ impl<'a> Lower<'a> {
             };
             out.push(x);
         }
-        let one = match numeric {
-            Numeric::Uint | Numeric::Sint => 1,
-            _ => 1.0f32.to_bits(),
-        };
-        for k in out.len() as u32..channels {
-            out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
-        }
-        out.truncate(channels as usize);
+        out.resize(channels as usize, self.s.m.i32(0));
         Ok(out)
     }
 

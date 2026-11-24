@@ -357,7 +357,7 @@ const CS_CASES: &[(&str, &str)] = &[
     // Typed loads (`tbuffer_load_format_*`, Grand Theft Auto VI's vertex
     // fetch) convert by the format the instruction names: the PC reads the
     // same bytes through typed views in those formats. Channels past the
-    // format's read (0, 0, 0, 1); a byte format at unaligned offsets.
+    // format's read 0; a byte format at unaligned offsets.
     (
         "typed loads",
         r#"CS {
@@ -374,7 +374,7 @@ const CS_CASES: &[(&str, &str)] = &[
             hh = raw.XB_TypedLoad4(4 * e, FMT(1, 10));
         #else
             a = asuint(unorm8x4[e]);
-            b = asuint(snorm16x2[e]);
+            b = uint4(asuint(snorm16x2[e].xy), 0, 0);
             c = uint8x4[e];
             dd = asuint(unorm10x3_2[e]);
             ee = uint16x4[e & 15];
