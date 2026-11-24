@@ -232,8 +232,14 @@ fn system_timestamp() -> u64 {
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(windows)]
-static LAST_1440P: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
-    std::sync::Mutex::new(None);
+static WORLD_TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Selected target index for `VICTORY_PRESENT_WORLD`: `None` = normal swapchain
+/// output, `Some(i)` = lock onto target `i` from the frame's `>= 1280x720`
+/// color targets. Cycle live with F8 (prev), F9 (next), F10 (normal).
+#[cfg(windows)]
+static WORLD_TARGET_IDX: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
 
 #[cfg(windows)]
 fn present_world_on() -> bool {
@@ -245,13 +251,17 @@ fn present_world_on() -> bool {
 }
 
 /// Notes a `>= 1280x720` color texture written via RTV or UAV when
-/// `VICTORY_PRESENT_WORLD` (or `VICTORY_PRESENT_1440P`) is set, so we can
-/// display the internal rendered 3D world target on both Series S and Series X
-/// while the final upscale pass outputs zero.
+/// `VICTORY_PRESENT_WORLD` (or `VICTORY_PRESENT_1440P`) is set, preserving
+/// first-use order so F8/F9 can lock onto a specific 3D target without flicker.
 #[cfg(windows)]
 pub(crate) fn note_world_target(resource: This) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     if resource.is_null() || !present_world_on() {
+        return;
+    }
+    let key = resource as usize;
+    let mut list = WORLD_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    if list.len() >= 24 || list.iter().any(|&(k, _)| k == key) {
         return;
     }
     let Some(copy) = crate::resource::host_copy(resource) else {
@@ -265,16 +275,80 @@ pub(crate) fn note_world_target(resource: This) {
         && d.Height >= 720
         && matches!(d.Format.0, 28 | 29 | 87 | 91)
     {
-        *LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+        list.push((key, copy));
     }
 }
 
 #[cfg(windows)]
-fn take_1440p_target() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+fn pick_world_target(
+    primary_w: u64,
+    primary_h: u32,
+) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+    }
     if !present_world_on() {
         return None;
     }
-    LAST_1440P.lock().unwrap_or_else(|e| e.into_inner()).take()
+    let all = std::mem::take(&mut *WORLD_TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let cands: Vec<std::sync::Arc<crate::resource::HostTexture>> = all
+        .into_iter()
+        .map(|(_, c)| c)
+        .filter(|c| {
+            // SAFETY: a live host texture.
+            let d = unsafe { c.texture.GetDesc() };
+            (d.Width, d.Height) != (primary_w, primary_h)
+        })
+        .collect();
+    // Poll F8 (0x77 prev), F9 (0x78 next), F10 (0x79 normal) with edge trigger.
+    static LAST_KEYS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    // SAFETY: Win32 key-state query.
+    let (f8, f9, f10) = unsafe {
+        (
+            (GetAsyncKeyState(0x77) as u16 & 0x8000) != 0,
+            (GetAsyncKeyState(0x78) as u16 & 0x8000) != 0,
+            (GetAsyncKeyState(0x79) as u16 & 0x8000) != 0,
+        )
+    };
+    let bits = u8::from(f8) | (u8::from(f9) << 1) | (u8::from(f10) << 2);
+    let prev = LAST_KEYS.swap(bits, Ordering::Relaxed);
+    let pressed = bits & !prev;
+    let mut idx = WORLD_TARGET_IDX.lock().unwrap_or_else(|e| e.into_inner());
+    if pressed & 4 != 0 {
+        *idx = None;
+        tracing::info!("VICTORY_PRESENT_WORLD: switched back to normal game output (F10)");
+    } else if !cands.is_empty() {
+        if pressed & 2 != 0 {
+            let next = idx.map_or(0, |i| (i + 1) % cands.len());
+            *idx = Some(next);
+            // SAFETY: live host texture.
+            let d = unsafe { cands[next].texture.GetDesc() };
+            tracing::info!(
+                target = next,
+                total = cands.len(),
+                width = d.Width,
+                height = d.Height,
+                format = d.Format.0,
+                "VICTORY_PRESENT_WORLD: locked target (F9 next / F8 prev / F10 normal)"
+            );
+        } else if pressed & 1 != 0 {
+            let next = idx.map_or(cands.len() - 1, |i| (i + cands.len() - 1) % cands.len());
+            *idx = Some(next);
+            // SAFETY: live host texture.
+            let d = unsafe { cands[next].texture.GetDesc() };
+            tracing::info!(
+                target = next,
+                total = cands.len(),
+                width = d.Width,
+                height = d.Height,
+                format = d.Format.0,
+                "VICTORY_PRESENT_WORLD: locked target (F9 next / F8 prev / F10 normal)"
+            );
+        }
+    }
+    let chosen = (*idx)?;
+    cands.get(chosen).or_else(|| cands.last()).cloned()
 }
 
 #[cfg(feature = "diagnostics")]
@@ -346,36 +420,20 @@ extern "system" fn present(
                 resources.push((resource, texture, state));
             }
         }
-        let fallback_1440p = take_1440p_target();
         if !resources.is_empty() {
             let mut sources: Vec<(&_, u32)> = resources
                 .iter()
                 .map(|(_, tex, state)| (*tex, *state))
                 .collect();
-            if let Some(ref copy) = fallback_1440p {
-                // SAFETY: live host textures.
-                let (prim_d, cand_d) = unsafe { (sources[0].0.GetDesc(), copy.texture.GetDesc()) };
-                // Only substitute when the internal world target is smaller than
-                // the presented plane 0 (so native-res menus & title cards stay
-                // untouched).
-                if (cand_d.Width, cand_d.Height) != (prim_d.Width, prim_d.Height) {
-                    let state = crate::host::legal_state(
-                        &copy.texture,
-                        copy.state.load(Ordering::Relaxed),
-                    );
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        tracing::info!(
-                            width = cand_d.Width,
-                            height = cand_d.Height,
-                            format = cand_d.Format.0,
-                            primary_w = prim_d.Width,
-                            primary_h = prim_d.Height,
-                            "VICTORY_PRESENT_WORLD: presenting internal world target as plane 0"
-                        );
-                    });
-                    sources[0] = (&copy.texture, state);
-                }
+            // SAFETY: live host texture.
+            let prim_d = unsafe { sources[0].0.GetDesc() };
+            let fallback_world = pick_world_target(prim_d.Width, prim_d.Height);
+            if let Some(ref copy) = fallback_world {
+                let state = crate::host::legal_state(
+                    &copy.texture,
+                    copy.state.load(Ordering::Relaxed),
+                );
+                sources[0] = (&copy.texture, state);
             }
             let shown = host.present(&sources, frame);
             for &(resource, _, state) in &resources {

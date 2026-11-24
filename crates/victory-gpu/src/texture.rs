@@ -57,6 +57,7 @@ pub(crate) struct Staging {
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
+    stable_hits: u32,
     asked: u64,
     read: Vec<u8>,
 }
@@ -215,15 +216,26 @@ impl Staging {
             );
             return 0;
         }
+        // Static unwatched textures (streamed world assets) rarely change once
+        // populated; after 3 identical hashes in a row, re-verify only every
+        // 16th submission instead of hashing ~150 MB every frame.
+        if last.hash.is_some() && last.stable_hits >= 3 {
+            last.stable_hits = last.stable_hits.wrapping_add(1);
+            if (last.stable_hits & 15) != 0 {
+                return 0;
+            }
+        }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            last.stable_hits = last.stable_hits.saturating_add(1);
             return size;
         }
         last.hash = Some(hash);
+        last.stable_hits = 0;
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
