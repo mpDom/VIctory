@@ -8,6 +8,12 @@
 //! The entry is our own encoding of [`HostShader`]: a field added to it
 //! must be added to [`encode`] and [`decode`] too (entries of older builds
 //! are ignored anyway).
+//!
+//! A container this build cannot translate is cached too, as its error:
+//! translation depends only on the container and on what [`build`]
+//! hashes, so it would fail the same way again. Without that, every run
+//! translated the same few hundred refused programs again (seconds each
+//! for the large ones) while the title waited for them.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -107,9 +113,12 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let bytes = match (self.translate)(&input[32..]) {
+            Ok(shader) => encode(&shader),
+            Err(error) => encode_failure(&error),
+        };
         self.translated.store(true, Ordering::Relaxed);
-        Ok(encode(&shader))
+        Ok(bytes)
     }
 }
 
@@ -136,15 +145,18 @@ fn cached(
             }
             Err(e) => return Err(format!("{e:#}")),
         };
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        let entry = std::fs::read(&path)
+            .ok()
+            .and_then(|b| decode(&b).map(Ok).or_else(|| decode_failure(&b).map(Err)));
+        if let Some(result) = entry {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            tracing::debug!(path = %path.display(), ok = result.is_ok(), "shader {what}");
+            return result;
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
@@ -154,6 +166,18 @@ fn cached(
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
+/// The entry of a container that does not translate: this, then the
+/// error's text (UTF-8).
+const FAILED: &[u8; 4] = b"VSF1";
+
+fn encode_failure(error: &str) -> Vec<u8> {
+    [FAILED.as_slice(), error.as_bytes()].concat()
+}
+
+fn decode_failure(bytes: &[u8]) -> Option<String> {
+    let text = bytes.strip_prefix(FAILED.as_slice())?;
+    String::from_utf8(text.to_vec()).ok()
+}
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -352,10 +376,49 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
 
-        // Failures are not stored.
-        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, b"other", fail).is_err());
+    #[test]
+    fn failures_come_back_from_the_cache_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"a container that does not translate".as_slice();
+        let runs = AtomicU64::new(0);
+        let fail = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Err::<HostShader, _>("a scalar memory read as data is not supported".to_owned())
+        };
+        let error = Err("a scalar memory read as data is not supported".to_owned());
+        assert_eq!(cached(&cache, &build, container, fail), error);
+        assert_eq!(cached(&cache, &build, container, fail), error);
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
+
+        // Another build tries again, and may translate it.
+        let ok = |_: &[u8]| Ok(shader());
+        assert_eq!(cached(&cache, &[8; 32], container, ok), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, fail), error);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+        // A damaged failure entry is a miss, tried again.
+        for e in walk(dir.path()) {
+            if std::fs::read(&e).unwrap().starts_with(FAILED) {
+                std::fs::write(e, [FAILED.as_slice(), &[0xff, 0xfe]].concat()).unwrap();
+            }
+        }
+        assert_eq!(cached(&cache, &build, container, fail), error);
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn failure_entries_round_trip_and_are_no_shader() {
+        let bytes = encode_failure("an address not from a root parameter");
+        assert_eq!(
+            decode_failure(&bytes).as_deref(),
+            Some("an address not from a root parameter")
+        );
+        assert_eq!(decode(&bytes), None);
+        assert_eq!(decode_failure(&encode(&shader())), None);
     }
 
     #[test]
