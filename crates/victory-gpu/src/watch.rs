@@ -54,11 +54,29 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    // Guarded blocks all still clean: nothing was written there, and the
+    // answer is the journal's. Asking the kernel would fail (views are not
+    // write-watched) and `guard`'s query walks the view's pages; for a big
+    // clean view both cost more than the copy they decide. Blocks are
+    // pages, so `first..last` are the blocks. `JOURNAL` is taken before
+    // `GUARDS` here as in `guard`; nothing takes them the other way round.
+    if guarded && first < last && guards().clean.range(first..last).count() == last - first {
+        j.asked += 1;
+        return Some((
+            j.asked,
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ));
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(test)]
+    tests::KERNEL_ASKED.with(|n| n.set(n.get() + 1));
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -102,6 +120,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
+// `writes` reads blocks as pages.
+const _: () = assert!(BLOCK == PAGE);
 
 struct Guards {
     /// Blocks we made read-only.
@@ -288,6 +308,129 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    thread_local! {
+        /// The kernel askings `writes` made on this thread (each test runs
+        /// on its own).
+        pub(super) static KERNEL_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn kernel_asked() -> usize {
+        KERNEL_ASKED.with(|n| n.get())
+    }
+
+    /// A pagefile section of `blocks` blocks, mapped read-write.
+    fn view(blocks: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a fresh section; the view is ours.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (blocks * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, blocks * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        view
+    }
+
+    /// Unmaps a view from [`view`], first forgetting its pages' journal
+    /// entries: the next allocation there is not written.
+    fn unmap(view: usize, blocks: usize) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        let pages = view / PAGE..(view + blocks * BLOCK) / PAGE;
+        JOURNAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .written
+            .retain(|p, _| !pages.contains(p));
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        title_memory_remapped(view, blocks * BLOCK);
+    }
+
+    /// A clean guarded view is answered from the journal, without the
+    /// kernel; a write to it (by the title, or announced) is still seen.
+    #[test]
+    fn clean_guarded_views_are_answered_from_the_journal() {
+        let v = view(4);
+        let (start, end) = (v, v + 4 * BLOCK);
+        let first = v / PAGE;
+        let asked = kernel_asked();
+        // The first asking guards every block: all are written as far as
+        // anyone knows.
+        let (taken, all) = writes(start, end, true).expect("a view");
+        assert_eq!(kernel_asked(), asked + 1);
+        assert_eq!(all, (first..first + 4).map(|p| (p, taken)).collect::<Vec<_>>());
+        // Clean since: the kernel is not asked, the journal answers as before.
+        for _ in 0..3 {
+            let (now, same) = writes(start, end, true).expect("a view");
+            assert!(now > taken);
+            assert_eq!(same, all);
+        }
+        let (_, part) = writes(v + BLOCK + 10, v + 2 * BLOCK - 10, true).expect("a view");
+        assert_eq!(part, [(first + 1, taken)]);
+        assert_eq!(kernel_asked(), asked + 1);
+
+        // The title writes block 2: the handler opens it; the kernel is asked.
+        // SAFETY: our view, guarded read-only; the handler gives write access.
+        unsafe { ((v + 2 * BLOCK + 8) as *mut u8).write(7) };
+        let (written, after) = writes(start, end, true).expect("a view");
+        assert_eq!(kernel_asked(), asked + 2);
+        assert_eq!(after[2], (first + 2, written));
+        assert_eq!(after.iter().filter(|&&(_, w)| w == written).count(), 1);
+        // SAFETY: as above, readable.
+        assert_eq!(unsafe { ((v + 2 * BLOCK + 8) as *const u8).read() }, 7);
+        // Guarded again, and clean.
+        let (_, again) = writes(start, end, true).expect("a view");
+        assert_eq!(again, after);
+        assert_eq!(kernel_asked(), asked + 2);
+
+        // Our own write through the kernel, announced.
+        writing(v + 3 * BLOCK, 1);
+        let (announced, after) = writes(start, end, true).expect("a view");
+        assert_eq!(kernel_asked(), asked + 3);
+        assert_eq!(after[3], (first + 3, announced));
+
+        // The runtime remapped block 0.
+        title_memory_remapped(v, BLOCK);
+        let (remapped, after) = writes(start, end, true).expect("a view");
+        assert_eq!(kernel_asked(), asked + 4);
+        assert_eq!(after[0], (first, remapped));
+        let (_, settled) = writes(start, end, true).expect("a view");
+        assert_eq!(settled, after);
+        assert_eq!(kernel_asked(), asked + 4);
+
+        // An empty range is not answered from the guards.
+        let _ = writes(v, v, true);
+        assert_eq!(kernel_asked(), asked + 5);
+        unmap(v, 4);
+    }
+
+    /// A range only partly guarded and clean asks the kernel.
+    #[test]
+    fn partly_clean_ranges_ask_the_kernel() {
+        let v = view(2);
+        let asked = kernel_asked();
+        // Only block 0 is guarded.
+        let _ = writes(v, v + BLOCK, true).expect("a view");
+        assert_eq!(kernel_asked(), asked + 1);
+        let (now, both) = writes(v, v + 2 * BLOCK, true).expect("a view");
+        assert_eq!(kernel_asked(), asked + 2);
+        assert_eq!(both.last(), Some(&(v / PAGE + 1, now)));
+        // Both guarded and clean now.
+        let _ = writes(v, v + 2 * BLOCK, true).expect("a view");
+        assert_eq!(kernel_asked(), asked + 2);
+        // Not guarded askers (texture hashes) never take the journal's word.
+        assert!(writes(v, v + 2 * BLOCK, false).is_none());
+        assert_eq!(kernel_asked(), asked + 3);
+        unmap(v, 2);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
